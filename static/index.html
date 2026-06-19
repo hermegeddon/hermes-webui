@@ -8,6 +8,27 @@
      MUST appear before manifest/favicon links so browsers resolve relative URLs against the
      correct base when the page is served from /session/<id> routes. See #2226. -->
 <script>(function(){var path=location.pathname,marker='/session/',i=path.indexOf(marker),p;i>=0?p=(path.slice(0,i+1)||'/'):p=(path.endsWith('/')?path:(path.replace(/\/[^\/]*$/,'/')||'/'));document.write('<base href="'+location.origin+p+'">');})()</script>
+<script>
+function _createHermesSafeStorage(name){
+  var nativeStorage=null;
+  var memory=Object.create(null);
+  try{nativeStorage=window[name];}catch(_){nativeStorage=null;}
+  function disableNative(){nativeStorage=null;}
+  function own(key){return Object.prototype.hasOwnProperty.call(memory,key);}
+  function memoryLength(){return Object.keys(memory).length;}
+  function memoryKey(index){var keys=Object.keys(memory),key=keys[index];return key===undefined?null:key;}
+  return {
+    get length(){try{return nativeStorage?nativeStorage.length:memoryLength();}catch(_){disableNative();return memoryLength();}},
+    key:function(index){try{return nativeStorage?nativeStorage.key(index):memoryKey(index);}catch(_){disableNative();return memoryKey(index);}},
+    getItem:function(key){key=String(key);try{return nativeStorage?nativeStorage.getItem(key):(own(key)?memory[key]:null);}catch(_){disableNative();return own(key)?memory[key]:null;}},
+    setItem:function(key,value){key=String(key);value=String(value);try{if(nativeStorage){nativeStorage.setItem(key,value);memory[key]=value;return;}}catch(_){disableNative();}memory[key]=value;},
+    removeItem:function(key){key=String(key);try{if(nativeStorage)nativeStorage.removeItem(key);}catch(_){disableNative();}delete memory[key];},
+    clear:function(){try{if(nativeStorage)nativeStorage.clear();}catch(_){disableNative();}memory=Object.create(null);}
+  };
+}
+let localStorage=_createHermesSafeStorage('localStorage');
+let sessionStorage=_createHermesSafeStorage('sessionStorage');
+</script>
 <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
 <link rel="icon" type="image/png" sizes="32x32" href="static/favicon-32.png">
 <link rel="shortcut icon" href="static/favicon.ico">
