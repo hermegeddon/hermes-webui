@@ -166,7 +166,7 @@ def test_send_chat_start_404_self_heals_instead_of_error_bubble():
 # ── Server: GET /api/session 404s a deleted WebUI session (#2782) ──
 
 
-def _invoke_api_session_keyerror(*, index_json, cli_messages):
+def _invoke_api_session_keyerror(*, index_json, cli_messages, missing_ok=False):
     """Drive GET /api/session with get_session() raising KeyError (the deleted-
     session fallthrough) and a patched _index.json. Returns the captured status.
     """
@@ -191,7 +191,10 @@ def _invoke_api_session_keyerror(*, index_json, cli_messages):
         def read_text(self, encoding="utf-8"):
             return index_json
 
-    parsed = urlparse("/api/session?session_id=gone_001&messages=0&resolve_model=0")
+    query = "session_id=gone_001&messages=0&resolve_model=0"
+    if missing_ok:
+        query += "&missing_ok=1"
+    parsed = urlparse(f"/api/session?{query}")
     with patch("api.routes.get_session", side_effect=KeyError("gone_001")), \
          patch("api.routes.SESSION_INDEX_FILE", _FakeIndexFile()), \
          patch("api.routes._lookup_cli_session_metadata", return_value={}), \
@@ -214,6 +217,46 @@ def test_get_session_404s_deleted_webui_session():
     assert captured["status"] == 404, (
         "a deleted WebUI session must return 404, not a 200 CLI stub"
     )
+
+
+def test_get_session_missing_ok_returns_null_for_deleted_webui_session():
+    """Root boot can preflight a saved stale ID without producing browser 404 noise."""
+    index = '[{"session_id": "gone_001", "source_tag": null, "raw_source": null, "session_source": null}]'
+    captured = _invoke_api_session_keyerror(
+        index_json=index,
+        cli_messages=[{"role": "user", "content": "hi", "timestamp": 1}],
+        missing_ok=True,
+    )
+    assert captured["status"] == 200
+    assert captured["data"] == {"session": None}
+
+
+def test_get_session_missing_ok_hides_profile_invisible_session_without_metadata():
+    """missing_ok must not leak foreign-profile metadata when visibility rejects a session."""
+    import api.routes as routes
+
+    captured = {}
+
+    def fake_j(_handler, data, status=200, extra_headers=None):
+        captured["data"] = data
+        captured["status"] = status
+        return data
+
+    def fake_bad(_handler, msg, status=400):
+        captured["data"] = {"error": msg}
+        captured["status"] = status
+        return {"error": msg}
+
+    parsed = urlparse("/api/session?session_id=foreign_001&messages=0&missing_ok=1")
+    session_obj = SimpleNamespace(profile="other-profile")
+    with patch("api.routes.get_session", return_value=session_obj), \
+         patch("api.routes._session_visible_to_active_profile", return_value=False), \
+         patch("api.routes.j", side_effect=fake_j), \
+         patch("api.routes.bad", side_effect=fake_bad):
+        routes.handle_get(SimpleNamespace(), parsed)
+
+    assert captured["status"] == 200
+    assert captured["data"] == {"session": None}
 
 
 def test_get_session_404s_deleted_fork_session():

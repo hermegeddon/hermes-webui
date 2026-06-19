@@ -9248,6 +9248,11 @@ def handle_get(handler, parsed) -> bool:
         sid = query.get("session_id", [""])[0]
         if not sid:
             return j(handler, {"error": "session_id is required"}, status=400)
+        missing_ok = str(query.get("missing_ok", [""])[0]).strip().lower() in ("1", "true", "yes")
+        def _session_missing_response():
+            if missing_ok:
+                return j(handler, {"session": None})
+            return bad(handler, "Session not found", 404)
         # ?messages=0 skips the message payload for fast session switching.
         # The frontend uses this when switching conversations in the sidebar
         # (only needs metadata). The full message array is loaded lazily
@@ -9282,7 +9287,7 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
-                return bad(handler, "Session not found", 404)
+                return _session_missing_response()
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
             cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
@@ -9616,11 +9621,11 @@ def handle_get(handler, parsed) -> bool:
                 except Exception:
                     pass
             if _was_webui_session:
-                return bad(handler, "Session not found", 404)
+                return _session_missing_response()
             cli_meta = _lookup_cli_session_metadata(sid)
             _session_profile = (cli_meta or {}).get("profile") or None
             if not _session_visible_to_active_profile(_session_profile, handler):
-                return bad(handler, "Session not found", 404)
+                return _session_missing_response()
             msgs = get_cli_session_messages(sid)
             if msgs:
                 sess = {
@@ -9650,7 +9655,7 @@ def handle_get(handler, parsed) -> bool:
                 attach_todo_state(sess, msgs)
                 sess = _merge_cli_sidebar_metadata(sess, cli_meta)
                 return j(handler, {"session": redact_session_data(sess)})
-            return bad(handler, "Session not found", 404)
+            return _session_missing_response()
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]

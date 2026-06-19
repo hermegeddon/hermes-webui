@@ -80,11 +80,36 @@ async function cancelSessionStream(session){
   if(typeof renderSessionList==='function') renderSessionList();
 }
 
+function _savedSessionListSnapshot(sid){
+  if(!sid) return null;
+  try{
+    if(typeof _allSessions==='undefined'||!Array.isArray(_allSessions)) return null;
+    return _allSessions.find(s=>s&&s.session_id===sid)||null;
+  }catch(_){
+    return null;
+  }
+}
+
+const _savedSessionMissingAfterProbe = new Set();
+
+function _savedSessionWasMissingAfterProbe(sid){
+  return !!(sid&&_savedSessionMissingAfterProbe.has(sid));
+}
+
 async function _savedSessionShouldStaySidebarOnly(sid){
   if(!sid) return false;
+  _savedSessionMissingAfterProbe.delete(sid);
+  const cachedSession=_savedSessionListSnapshot(sid);
+  if(cachedSession){
+    return !!(cachedSession&&(cachedSession.active_stream_id||cachedSession.pending_user_message||cachedSession.has_pending_user_message||cachedSession.is_streaming));
+  }
   try{
-    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0&missing_ok=1`);
     const session = data&&data.session;
+    if(data&&Object.prototype.hasOwnProperty.call(data,'session')&&session===null){
+      _savedSessionMissingAfterProbe.add(sid);
+      return false;
+    }
     return !!(session&&(session.active_stream_id||session.pending_user_message));
   }catch(e){
     return false;
@@ -2348,7 +2373,7 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
     }catch(e){console.warn('[pwa] new-chat launch action failed', e);}
   }
   const savedLocal=localStorage.getItem('hermes-webui-session');
-  const saved=urlSession||savedLocal;
+  let saved=urlSession||savedLocal;
   if(saved){
     try{
       if(!urlSession&&savedLocal&&await _savedSessionShouldStaySidebarOnly(savedLocal)){
@@ -2358,6 +2383,10 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
         $('emptyState').style.display='';
         await renderSessionList();if(typeof startGatewaySSE==='function')startGatewaySSE();
         return;
+      }
+      if(!urlSession&&savedLocal&&_savedSessionWasMissingAfterProbe(savedLocal)){
+        localStorage.removeItem('hermes-webui-session');
+        throw new Error('saved session missing');
       }
       await loadSession(saved);
       // Hard refresh starts from the static HTML model list. Hydrate the live
