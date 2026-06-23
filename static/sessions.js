@@ -175,6 +175,7 @@ let _sessionCompletionUnread = null;
 let _sessionObservedStreaming = null;
 const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
+const _sessionListSourceById = new Map();
 let _sessionListPointerActive = false;
 let _sessionListLastScrollAt = 0;
 let _pendingSessionListPayload = null;
@@ -368,7 +369,11 @@ function _isSessionLocallyStreaming(s) {
 }
 
 function _isSessionEffectivelyStreaming(s) {
-  return Boolean(s && (s.is_streaming || _isSessionLocallyStreaming(s)));
+  return Boolean(s && (
+    s.is_streaming ||
+    _hasPendingUserMessageSignal(s) ||
+    _isSessionLocallyStreaming(s)
+  ));
 }
 
 function _hasPendingUserMessageSignal(s) {
@@ -376,7 +381,7 @@ function _hasPendingUserMessageSignal(s) {
 }
 
 function _isServerIdleSessionRow(s) {
-  return Boolean(s && s.session_id && !s.is_streaming && !s.active_stream_id && !s.pending_user_message && !s.has_pending_user_message);
+  return Boolean(s && s.session_id && !s.is_streaming && !s.active_stream_id && !s.pending_user_message && !s.has_pending_user_message && !s.pending_started_at);
 }
 
 function _reconcileActiveSessionIdleStateFromList(serverRows) {
@@ -445,6 +450,16 @@ function _purgeStaleInflightEntries() {
       if (s && s.session_id) sessionsById.set(s.session_id, s);
     }
   }
+  const sourceById = typeof _sessionListSourceById !== 'undefined'
+    && _sessionListSourceById
+    && typeof _sessionListSourceById.get === 'function'
+    ? _sessionListSourceById
+    : null;
+  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
+    && _allSessionsScope
+    && typeof _allSessionsScope.sidebarSource === 'string'
+    ? _allSessionsScope.sidebarSource
+    : null;
   for (const sid of Object.keys(INFLIGHT)) {
     // #4354: purge stale INFLIGHT even for a hung/idle session, BUT skip the one
     // session actively mid-send (#2689 start-race) — during /api/chat/start the
@@ -454,6 +469,10 @@ function _purgeStaleInflightEntries() {
       continue;
     }
     if (!sessionsById.has(sid)) {
+      const knownSource = sourceById ? sourceById.get(sid) : null;
+      if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) {
+        continue;
+      }
       // Session is absent from _allSessions — it was deleted / archived /
       // filtered and can never stream again, so drop the entry.
       delete INFLIGHT[sid];
@@ -470,8 +489,37 @@ function _purgeStaleInflightEntries() {
   }
 }
 
+function _rememberSessionListSource(s, sid = null, allowScopeFallback = true) {
+  const resolvedSid = sid || (s && s.session_id);
+  if (!resolvedSid) return;
+  let source = null;
+  if (s && typeof _isCliSession === 'function') {
+    source = _isCliSession(s) ? 'cli' : 'webui';
+  }
+  if (!source && Array.isArray(_allSessions)) {
+    const cached = _allSessions.find(item => item && item.session_id === resolvedSid);
+    if (cached && typeof _isCliSession === 'function') {
+      source = _isCliSession(cached) ? 'cli' : 'webui';
+    }
+  }
+  if (!source
+    && allowScopeFallback
+    && typeof _allSessionsScope !== 'undefined'
+    && _allSessionsScope
+    && typeof _allSessionsScope.sidebarSource === 'string') {
+    source = _allSessionsScope.sidebarSource;
+  }
+  if (source
+    && typeof _sessionListSourceById !== 'undefined'
+    && _sessionListSourceById
+    && typeof _sessionListSourceById.set === 'function') {
+    _sessionListSourceById.set(resolvedSid, source);
+  }
+}
+
 function _rememberRenderedStreamingState(s, isStreaming) {
   if (!s || !s.session_id || !isStreaming) return;
+  if (typeof _rememberSessionListSource === 'function') _rememberSessionListSource(s);
   _sessionStreamingById.set(s.session_id, true);
   _rememberObservedStreamingSession(s);
 }
@@ -576,6 +624,7 @@ function _renderRuntimeJournalAnchorActivityScene(activeStreamId, sid){
 
 function _rememberRenderedSessionSnapshot(s) {
   if (!s || !s.session_id) return;
+  if (typeof _rememberSessionListSource === 'function') _rememberSessionListSource(s);
   const previous = _sessionListSnapshotById.get(s.session_id);
   if (previous) return;
   _sessionListSnapshotById.set(s.session_id, {
@@ -610,6 +659,7 @@ function _markSessionCompletedInList(session, previousSid = null) {
     pending_started_at: null,
     is_streaming: false,
   };
+  if (typeof _rememberSessionListSource === 'function') _rememberSessionListSource(_allSessions[idx], finalSid);
   _sessionStreamingById.set(finalSid, false);
   _forgetObservedStreamingSession(finalSid);
   if (previousSid && previousSid !== finalSid) {
@@ -621,6 +671,7 @@ function _markSessionCompletedInList(session, previousSid = null) {
     _sessionStreamingById.delete(previousSid);
     _forgetObservedStreamingSession(previousSid);
     _sessionListSnapshotById.delete(previousSid);
+    _sessionListSourceById.delete(previousSid);
   }
   _sessionListSnapshotById.set(finalSid, {
     message_count: messageCount,
@@ -632,17 +683,32 @@ function _markSessionCompletedInList(session, previousSid = null) {
 function _markPollingCompletionUnreadTransitions(sessions) {
   if (!Array.isArray(sessions)) return;
   const seen = new Set();
+  const sourceById = typeof _sessionListSourceById !== 'undefined'
+    && _sessionListSourceById
+    && typeof _sessionListSourceById.get === 'function'
+    && typeof _sessionListSourceById.keys === 'function'
+    && typeof _sessionListSourceById.delete === 'function'
+    ? _sessionListSourceById
+    : new Map();
+  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
+    && _allSessionsScope
+    && typeof _allSessionsScope.sidebarSource === 'string'
+    ? _allSessionsScope.sidebarSource
+    : null;
   for (const s of sessions) {
     if (!s || !s.session_id) continue;
     const sid = s.session_id;
     seen.add(sid);
+    if (typeof _rememberSessionListSource === 'function') _rememberSessionListSource(s, sid);
     const wasStreaming = _sessionStreamingById.get(sid);
     const isStreaming = _isSessionEffectivelyStreaming(s);
     const previousSnapshot = _sessionListSnapshotById.get(sid);
     const observedStreaming = _getSessionObservedStreaming()[sid];
     const messageCount = Number(s.message_count || 0);
     const lastMessageAt = Number(s.last_message_at || 0);
-    const completedObservedStream = wasStreaming === true && !isStreaming;
+    const hasServerRunSignal=Boolean(s.is_streaming||_hasPendingUserMessageSignal(s));
+    const canMarkCompletedStream=Boolean(hasServerRunSignal||previousSnapshot||observedStreaming);
+    const completedObservedStream = canMarkCompletedStream&&wasStreaming === true && !isStreaming;
     const completedWithNewMessages = Boolean(
       (previousSnapshot || observedStreaming)
       && !isStreaming
@@ -671,11 +737,18 @@ function _markPollingCompletionUnreadTransitions(sessions) {
       last_message_at: lastMessageAt,
     });
   }
-  for (const sid of Array.from(_sessionStreamingById.keys())) {
-    if (!seen.has(sid)) _sessionStreamingById.delete(sid);
-  }
-  for (const sid of Array.from(_sessionListSnapshotById.keys())) {
-    if (!seen.has(sid)) _sessionListSnapshotById.delete(sid);
+  const staleRuntimeStateSids = new Set([
+    ...Array.from(_sessionStreamingById.keys()),
+    ...Array.from(_sessionListSnapshotById.keys()),
+    ...Array.from(sourceById.keys()),
+  ]);
+  for (const sid of staleRuntimeStateSids) {
+    if (seen.has(sid)) continue;
+    const knownSource = sourceById.get(sid);
+    if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) continue;
+    _sessionStreamingById.delete(sid);
+    _sessionListSnapshotById.delete(sid);
+    sourceById.delete(sid);
   }
 }
 
@@ -1555,6 +1628,29 @@ function _sessionSourceLabel(filter, count) {
   return filter === 'cli' ? `CLI sessions (${n})` : `WebUI sessions (${n})`;
 }
 
+function _clearSessionSourceTabCounts() {
+  _serverWebuiSessionCount = null;
+  _serverCliSessionCount = null;
+}
+
+function _requestedSessionSidebarSource() {
+  return window._showCliSessions ? _sessionSourceFilter : 'webui';
+}
+
+function _sessionListQueryString() {
+  const qs = new URLSearchParams();
+  qs.set('sidebar_source', _requestedSessionSidebarSource());
+  if(_showAllProfiles) qs.set('all_profiles','1');
+  if(_showArchived) qs.set('include_archived','1');
+  return `?${qs.toString()}`;
+}
+
+function _sessionSourceTabCount(filter, renderedWebuiSessionCount, renderedCliSessionCount) {
+  const serverCount = filter === 'cli' ? _serverCliSessionCount : _serverWebuiSessionCount;
+  if (Number.isFinite(serverCount)) return serverCount;
+  return filter === 'cli' ? renderedCliSessionCount : renderedWebuiSessionCount;
+}
+
 function _setSessionSourceFilter(filter) {
   const next = filter === 'cli' ? 'cli' : 'webui';
   if (_sessionSourceFilter === next) return;
@@ -1564,6 +1660,7 @@ function _setSessionSourceFilter(filter) {
   _sessionSelectMode = false;
   try { localStorage.setItem('hermes-session-source-filter', next); } catch (_e) {}
   renderSessionListFromCache();
+  void renderSessionList({deferWhileInteracting:false});
 }
 
 function _restoreSessionSourceFilter() {
@@ -2667,6 +2764,8 @@ let _showAllProfiles = false;  // false = filter to active profile only
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
 let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
 let _archivedCliCount = 0;        // archived non-WebUI sessions not fetched until requested
+let _serverWebuiSessionCount = null;  // explicit server count for WebUI sessions
+let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
 _restoreSessionSourceFilter();
 let _sessionActionMenu = null;
@@ -3345,8 +3444,11 @@ function _openSessionActionMenu(session, anchorEl){
       try{
         await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
         session.pinned=newPinned;
+        const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
+        if(cached) cached.pinned=newPinned;
         if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
-        renderSessionList();
+        renderSessionListFromCache();
+        void renderSessionList();
       }catch(err){
         showToast(t('session_pin_failed')+err.message);
         await renderSessionList();
@@ -3488,9 +3590,102 @@ let _sessionListRefreshAnimationPending = false;
 let _sessionListFirstRenderAnimated = false;
 let _sessionListEnterAllAnimationPending = false;
 
+// #4671: invalidate any session-list render that is in flight or queued. Called at
+// profile-switch start (with showSessionListSkeleton) so a pre-switch /api/sessions
+// response — which carries the OLD profile's rows but was issued before the switch
+// bumped the generation, so it would otherwise pass the _renderSessionListGen guard,
+// clear the skeleton flag, and paint stale rows over the skeleton — is discarded.
+// Bumping the generation makes every outstanding response stale; clearing the
+// pending/queued payloads drops a deferred apply that would do the same.
+function _invalidateSessionListRenders(){
+  _renderSessionListGen++;
+  _pendingSessionListPayload = null;
+  _renderSessionListQueuedRequest = null;
+}
+if(typeof window!=='undefined') window._invalidateSessionListRenders = _invalidateSessionListRenders;
+
+// #4671: profile-switch session-list EMBARGO. Point-in-time invalidation isn't enough —
+// a renderSessionList() can START after the skeleton is shown but BEFORE /api/profile/switch
+// returns (the profile cookie is only set by the switch response), so that GET fetches the
+// OLD profile's rows, passes the generation guard, and clobbers the skeleton. While the
+// embargo is on, _runRenderSessionListRefresh drops ALL payloads (none may paint), so only
+// the switch-owned render — which runs after the switch clears the embargo — replaces the
+// skeleton. The switch sets it before showSessionListSkeleton() and clears it immediately
+// before its own renderSessionList() (and in the failure-restore path).
+let _profileSwitchListEmbargo = false;
+function _setProfileSwitchListEmbargo(on){ _profileSwitchListEmbargo = !!on; }
+if(typeof window!=='undefined') window._setProfileSwitchListEmbargo = _setProfileSwitchListEmbargo;
+
 function animateNextSessionListRefresh(options={}){
   _sessionListRefreshAnimationPending = true;
   if(options&&options.enterAll) _sessionListEnterAllAnimationPending = true;
+}
+
+// ── Loading skeletons (#4662 Phase 1) ───────────────────────────────────────
+// Tracks whether the session list is currently showing a skeleton so a
+// resolving render knows to replace it (and so we don't stack skeletons).
+let _sessionListSkeletonActive = false;
+
+// Skeleton structure mirrors a real sidebar: a couple of group headers
+// (Pinned / Today / Last week) with single-line rows under each. Title widths
+// vary so it reads as real conversations. `stamp:false` omits the timestamp bar
+// on the occasional row (a real list mixes rows with/without a visible time).
+const _SESSION_SKELETON_GROUPS = [
+  {rows: [{title: 70}]},
+  {rows: [{title: 84}, {title: 58}, {title: 76}]},
+  {rows: [{title: 64}, {title: 90}, {title: 52}, {title: 72}]},
+];
+
+// Render a skeleton placeholder into #sessionList that mirrors the real row
+// anatomy (group labels + single-line title bars with a short timestamp bar).
+// Called the instant a profile switch begins so the user never sees the
+// previous profile's conversations.
+function showSessionListSkeleton(){
+  const list = $('sessionList');
+  if(!list) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'skeleton-list';
+  wrap.setAttribute('aria-hidden', 'true');
+  let rowIndex = 0;
+  for(const group of _SESSION_SKELETON_GROUPS){
+    const label = document.createElement('div');
+    label.className = 'skeleton-group-label';
+    wrap.appendChild(label);
+    for(const spec of group.rows){
+      const row = document.createElement('div');
+      row.className = 'skeleton-row';
+      // Stagger the fade-in per row. Set inline (not via CSS :nth-child) because
+      // group-label siblings are interleaved with rows, so a :nth-child stagger
+      // would skip most rows. Cap so the longest list doesn't feel laggy.
+      row.style.animationDelay = Math.min(rowIndex * 0.025, 0.2) + 's';
+      rowIndex++;
+      const title = document.createElement('div');
+      title.className = 'skeleton-bar skeleton-title';
+      title.style.width = spec.title + '%';
+      const stamp = document.createElement('div');
+      stamp.className = 'skeleton-bar skeleton-stamp';
+      row.appendChild(title);
+      row.appendChild(stamp);
+      wrap.appendChild(row);
+    }
+  }
+  list.innerHTML = '';
+  list.appendChild(wrap);
+  list.scrollTop = 0;
+  // Tear down any active virtual-scroll state so a pending scroll-driven render
+  // can't repaint the previous profile's cached rows over this skeleton (#4662
+  // Codex gate). Cancel the queued RAF and drop the data-session-virtual-*
+  // window markers; the real render rebuilds them from the new payload.
+  if(typeof _sessionVirtualScrollRaf!=='undefined'&&_sessionVirtualScrollRaf){
+    cancelAnimationFrame(_sessionVirtualScrollRaf);
+    _sessionVirtualScrollRaf=0;
+  }
+  delete list.dataset.sessionVirtualTotal;
+  delete list.dataset.sessionVirtualStart;
+  delete list.dataset.sessionVirtualEnd;
+  delete list.dataset.sessionVirtualFilter;
+  delete list.dataset.sessionVirtualActiveAnchor;
+  _sessionListSkeletonActive = true;
 }
 
 function _isOptimisticFirstTurnSessionRow(s){
@@ -3523,6 +3718,7 @@ function _shouldKeepLocalOnlyOptimisticSessionRow(local){
 
 function _dropStaleOptimisticSessionRow(sid){
   if(!sid) return;
+  if(typeof _rememberSessionListSource==='function') _rememberSessionListSource(null, sid, false);
   if(INFLIGHT&&INFLIGHT[sid]){
     delete INFLIGHT[sid];
     if(typeof clearInflightState==='function') clearInflightState(sid);
@@ -3644,6 +3840,14 @@ function _applySessionListPayload(sessData, projData){
   _otherProfileCount = sessData.other_profile_count || 0;
   _archivedWebuiCount = Number(sessData.archived_webui_count ?? sessData.archived_count ?? 0);
   _archivedCliCount = Number(sessData.archived_cli_count ?? 0);
+  _serverWebuiSessionCount = Object.prototype.hasOwnProperty.call(sessData, 'webui_session_count')
+    ? Number(sessData.webui_session_count)
+    : null;
+  _serverCliSessionCount = Object.prototype.hasOwnProperty.call(sessData, 'cli_session_count')
+    ? Number(sessData.cli_session_count)
+    : null;
+  if (!Number.isFinite(_serverWebuiSessionCount)) _serverWebuiSessionCount = null;
+  if (!Number.isFinite(_serverCliSessionCount)) _serverCliSessionCount = null;
   // Capture server clock for clock-skew compensation (issue #1144).
   // server_time is epoch seconds from the server's time.time().
   // _serverTimeDelta = client - server, so (Date.now() - _serverTimeDelta)
@@ -3668,6 +3872,7 @@ function _applySessionListPayload(sessData, projData){
       ? sessData.active_profile
       : (S.activeProfile || 'default'),
     allProfiles: !!_showAllProfiles,
+    sidebarSource: _requestedSessionSidebarSource(),
   };
   _syncSessionAttentionSoundState(_allSessions);
   _pruneLineageReportCacheToVisibleSessions(_allSessions);
@@ -3675,7 +3880,7 @@ function _applySessionListPayload(sessData, projData){
   _sessionListLoadError = null;
   _sessionListHasLoadedOnce = true;
   _markPollingCompletionUnreadTransitions(_allSessions);
-  const isStreaming = _allSessions.some(s => Boolean(s && s.is_streaming));
+  const isStreaming = _allSessions.some(s => _isSessionEffectivelyStreaming(s));
   if (isStreaming) {
     startStreamingPoll();
   } else {
@@ -3688,6 +3893,12 @@ function _applySessionListPayload(sessData, projData){
     _sessionListFirstRenderAnimated=true;
   }
   ensureSessionEventsSSE();
+  // #4671: this payload is the freshly-resolved /api/sessions response (and a superseded
+  // response was already discarded by the generation guard upstream), so _allSessions now
+  // holds the CURRENT profile's rows. Clear the skeleton flag right before painting so this
+  // authoritative render replaces the profile-switch skeleton — while unrelated renders that
+  // fire before this point stay blocked by the guard in renderSessionListFromCache().
+  _sessionListSkeletonActive = false;
   renderSessionListFromCache();  // no-ops if rename is in progress
 }
 
@@ -3718,10 +3929,7 @@ async function _runRenderSessionListRefresh(opts, _gen){
   if(!deferWhileInteracting) _pendingSessionListPayload=null;
   try{
     if(!($('sessionSearch').value||'').trim()) _contentSearchResults = [];
-    const qs = new URLSearchParams();
-    if(_showAllProfiles) qs.set('all_profiles','1');
-    if(_showArchived) qs.set('include_archived','1');
-    const sessionListQS = qs.toString() ? `?${qs.toString()}` : '';
+    const sessionListQS = _sessionListQueryString();
     const sessionRequestOpts={
       timeoutToast:false,
       timeoutMs:_sessionListHasLoadedOnce?30000:_SESSION_LIST_BOOT_TIMEOUT_MS,
@@ -3741,6 +3949,12 @@ async function _runRenderSessionListRefresh(opts, _gen){
     }
     // Discard stale response — a newer renderSessionList() call superseded us.
     if (_gen !== _renderSessionListGen) return;
+    // #4671: while a profile switch is mid-flight, drop ANY payload — even one whose
+    // generation still matches — because a render that STARTED after the skeleton showed
+    // but before the switch response set the new-profile cookie fetched the OLD profile's
+    // rows. The switch clears the embargo immediately before its own (authoritative)
+    // renderSessionList(), so that render's payload is the first allowed to paint.
+    if (_profileSwitchListEmbargo) return;
     if(deferWhileInteracting&&_isSessionListUserInteracting()){
       _pendingSessionListPayload={gen:_gen,sessData,projData};
       _schedulePendingSessionListApply();
@@ -3749,6 +3963,11 @@ async function _runRenderSessionListRefresh(opts, _gen){
     _applySessionListPayload(sessData,projData);
   }catch(e){
     if (_gen !== _renderSessionListGen) return;
+    // #4671: same embargo guard as the success path — a mid-switch /api/sessions that
+    // FAILS must not clear the skeleton flag or render the old-profile cache either. The
+    // switch-owned render (after the embargo lifts) is the only one allowed to resolve the
+    // skeleton; if the switch itself fails, its catch clears the skeleton + embargo.
+    if (_profileSwitchListEmbargo) return;
     _showSessionListLoadError(e);
     // Only fall back to the cached rows if they were loaded under the SAME
     // scope we're requesting now. After a profile switch the cache holds the
@@ -3758,15 +3977,22 @@ async function _runRenderSessionListRefresh(opts, _gen){
     const _curScope = {
       profile: S.activeProfile || 'default',
       allProfiles: !!_showAllProfiles,
+      sidebarSource: _requestedSessionSidebarSource(),
     };
     const _scopeMatches = _allSessionsScope
       && _allSessionsScope.profile === _curScope.profile
-      && _allSessionsScope.allProfiles === _curScope.allProfiles;
+      && _allSessionsScope.allProfiles === _curScope.allProfiles
+      && _allSessionsScope.sidebarSource === _curScope.sidebarSource;
+    // #4671: the /api/sessions fetch failed — clear the skeleton flag so this error
+    // render (matched cache, or empty rows for a mismatched scope) replaces the
+    // up-front profile-switch skeleton instead of stranding it.
+    _sessionListSkeletonActive = false;
     if (_scopeMatches) {
       renderSessionListFromCache();
     } else {
       _allSessions = [];
-      _allSessionsScope = null;
+      _allSessionsScope = _curScope;
+      _clearSessionSourceTabCounts();
       renderSessionListFromCache();
     }
   }
@@ -4098,16 +4324,39 @@ function ensureSessionEventsSSE(){
 
 if(typeof window!=='undefined') window.refreshSessionList = refreshSessionList;
 
+let _gatewayPollVisibilityHandler = null; // saved so stopGatewayPollFallback can remove it
+
 function startGatewayPollFallback(ms){
   const intervalMs = Math.max(5000, Number(ms) || _gatewayFallbackPollMs);
   if(_gatewayPollTimer) clearInterval(_gatewayPollTimer);
-  _gatewayPollTimer = setInterval(() => { renderSessionList({deferWhileInteracting:true}); }, intervalMs);
+  _gatewayPollTimer = setInterval(() => {
+    // Skip poll when tab is hidden or a stream is active — saves CPU
+    // and avoids redundant DOM renders during active streaming (#4704).
+    if(typeof document !== 'undefined' && document.hidden) return;
+    if(typeof S !== 'undefined' && (S.busy || S.activeStreamId)) return;
+    renderSessionList({deferWhileInteracting:true});
+  }, intervalMs);
+  // Visibility catch-up: refresh immediately when tab re-gains focus,
+  // so no gateway updates are dropped during hidden-skip periods.
+  // Save the handler so stopGatewayPollFallback can removeEventListener it (#4730 review).
+  if(typeof document !== 'undefined' && !_gatewayPollVisibilityHandler){
+    _gatewayPollVisibilityHandler = () => {
+      if(!document.hidden && typeof renderSessionList === 'function'){
+        void renderSessionList({deferWhileInteracting:false});
+      }
+    };
+    document.addEventListener('visibilitychange', _gatewayPollVisibilityHandler);
+  }
 }
 
 function stopGatewayPollFallback(){
   if(_gatewayPollTimer){
     clearInterval(_gatewayPollTimer);
     _gatewayPollTimer = null;
+  }
+  if(_gatewayPollVisibilityHandler && typeof document !== 'undefined'){
+    document.removeEventListener('visibilitychange', _gatewayPollVisibilityHandler);
+    _gatewayPollVisibilityHandler = null;
   }
 }
 
@@ -4460,7 +4709,7 @@ function filterSessions(){
 }
 
 function _sessionTimestampMs(session) {
-  const raw = Number(session && (session.last_message_at || session.updated_at || session.created_at || 0));
+  const raw = Number(session && (session._sidebar_activity_at || session.last_message_at || session.updated_at || session.created_at || 0));
   return Number.isFinite(raw) ? raw * 1000 : 0;
 }
 
@@ -4854,6 +5103,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     delete row._child_session_streaming;
     delete row._child_session_has_unread;
     delete row._child_session_attention;
+    delete row._child_session_latest_at;
+    delete row._sidebar_activity_at;
     return row;
   };
   const rows=(collapsedRows||[])
@@ -4868,6 +5119,14 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
   const bubbleSidebarState=(parentRow, childRow)=>{
     if(isChildStreaming(childRow)) parentRow._child_session_streaming=true;
     if(childHasUnread(childRow)) parentRow._child_session_has_unread=true;
+    const childActivityRaw=childRow
+      ? (childRow._sidebar_activity_at??childRow.last_message_at??childRow.updated_at??childRow.created_at??0)
+      : 0;
+    const childActivitySec=Number(childActivityRaw);
+    if(Number.isFinite(childActivitySec)&&childActivitySec>Number(parentRow._child_session_latest_at||0)){
+      parentRow._child_session_latest_at=childActivitySec;
+      parentRow._sidebar_activity_at=Math.max(Number(parentRow.last_message_at||parentRow.updated_at||parentRow.created_at||0), childActivitySec);
+    }
     const childAttention=childRow&&childRow.attention&&typeof childRow.attention==='object'?childRow.attention:null;
     if(!childAttention||!childAttention.kind||!Number.isFinite(Number(childAttention.count))||Number(childAttention.count)<=0) return;
     const priorityFor=(kind)=>kind==='approval'?3:(kind==='clarify'?2:1);
@@ -4923,12 +5182,21 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     return false;
   };
   const orphans=[];
-  const attachQueue=[...(rawSessions||[])].sort((a,b)=>attachDepthFor(a)-attachDepthFor(b));
+  const renderableChildIds=new Set((rawSessions||[]).map(s=>s&&s.session_id).filter(Boolean));
+  const attachQueueById=new Map();
+  for(const candidate of [...(rawSessions||[]),...(referenceSessions||[])]){
+    if(candidate&&candidate.session_id&&!attachQueueById.has(candidate.session_id)) attachQueueById.set(candidate.session_id,candidate);
+  }
+  const attachQueue=[...attachQueueById.values()].sort((a,b)=>attachDepthFor(a)-attachDepthFor(b));
   for(const child of attachQueue){
+    const childRenderable=!!(child&&child.session_id&&renderableChildIds.has(child.session_id));
+    if(child&&child.session_id&&visibleBySid.has(child.session_id)) continue;
     const isForkChild=_isForkWithResolvableParent(child, sessionIdsInList)&&!(child&&child.pinned);
-    if(!_isChildSession(child)&&!isForkChild) continue;
+    const childLineageKey=child&&(child._lineage_root_id||child.lineage_root_id||child.parent_session_id);
+    const isHiddenLineageReferenceChild=!!(child&&child.archived&&child.parent_session_id&&childLineageKey&&!child.pinned&&!childRenderable);
+    if(!_isChildSession(child)&&!isForkChild&&!isHiddenLineageReferenceChild) continue;
     if(!isForkChild&&child._cross_surface_child_session){
-      orphans.push({...child,_orphan_child_session:true});
+      if(childRenderable) orphans.push({...child,_orphan_child_session:true});
       continue;
     }
     const parentSid=child.parent_session_id;
@@ -4942,22 +5210,27 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     if(!parentRow&&child._parent_lineage_root_id){
       parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
     }
+    if(!parentRow){
+      parentRow=visibleByLineageKey.get(childLineageKey||parentSid)||null;
+    }
     if(!parentRow&&hasHiddenArchivedAncestor(child)){
       hiddenArchivedChildTree.add(child.session_id);
       continue;
     }
     if(parentRow){
-      if(!Array.isArray(parentRow._child_sessions)) parentRow._child_sessions=[];
       const childCopy={...child};
       if(parentSegment){
         childCopy._parent_segment_id=parentSegment.session_id;
         childCopy._parent_segment_title=_sessionDisplayTitle(parentSegment)||child.parent_title||'Untitled';
       }
-      parentRow._child_sessions.push(childCopy);
-      parentRow._child_session_count=parentRow._child_sessions.length;
+      if(childRenderable&&!isHiddenLineageReferenceChild){
+        if(!Array.isArray(parentRow._child_sessions)) parentRow._child_sessions=[];
+        parentRow._child_sessions.push(childCopy);
+        parentRow._child_session_count=parentRow._child_sessions.length;
+      }
       bubbleSidebarState(parentRow, childCopy);
       visibleBySegmentSid.set(childCopy.session_id,{row: parentRow, seg: childCopy});
-    } else {
+    } else if(childRenderable) {
       orphans.push({...child,_orphan_child_session:true});
     }
   }
@@ -5103,6 +5376,7 @@ function _ensureActiveSessionRowPresent(rows, sourceRows){
 function clearOptimisticSessionStreaming(sid){
   sid=sid||(S.session&&S.session.session_id)||'';
   if(!sid) return;
+  if(typeof _rememberSessionListSource==='function') _rememberSessionListSource(null, sid, false);
   if(S.session&&S.session.session_id===sid){
     S.session.active_stream_id=null;
     S.activeStreamId=null;
@@ -5168,6 +5442,11 @@ function _sessionVirtualSpacer(height, where){
 
 function _scheduleSessionVirtualizedRender(){
   _sessionListLastScrollAt=Date.now();
+  // While a profile-switch skeleton is up, ignore virtual-scroll events: the
+  // cached rows are the PREVIOUS profile's, and repainting them here would
+  // clobber the skeleton before the new /api/sessions response lands (#4662
+  // Codex gate). The real render clears _sessionListSkeletonActive.
+  if(_sessionListSkeletonActive) return;
   if(_renamingSid||_sessionVirtualScrollRaf) return;
   const list=_sessionVirtualScrollList;
   const total=Number(list&&list.dataset&&list.dataset.sessionVirtualTotal||0);
@@ -5334,6 +5613,14 @@ function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
 
 
 function renderSessionListFromCache(){
+  // #4671: while a profile-switch skeleton is up, bail — _allSessions still holds the
+  // PREVIOUS profile's rows until /api/sessions resolves, so any unrelated caller
+  // (sidebar SSE syncs, stream/unread updates, gateway-poll timers, panel-resync
+  // repairs) hitting this mid-switch would repaint the wrong profile's rows over the
+  // skeleton. The authoritative switch render clears the flag from inside
+  // _applySessionListPayload — once _allSessions is fresh — so only a render backed by
+  // up-to-date data replaces the skeleton. The failure-restore path clears it too.
+  if(_sessionListSkeletonActive) return;
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;
   // Keep the per-conversation actions menu stable while the user is trying to
@@ -5367,12 +5654,10 @@ function renderSessionListFromCache(){
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const referenceRaw=_sessionSourceFilter==='cli'?cliReferenceRaw:webuiReferenceRaw;
   const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, referenceRaw);
-  const renderedWebuiSessionCount=_sessionSourceFilter==='webui'
-    ? sessions.length
-    : _renderSidebarRowsFromRawSessions(webuiSessionsRaw, webuiReferenceRaw).length;
-  const renderedCliSessionCount=_sessionSourceFilter==='cli'
-    ? sessions.length
-    : _renderSidebarRowsFromRawSessions(cliSessionsRaw, cliReferenceRaw).length;
+  const renderedWebuiSessionCount=_renderSidebarRowsFromRawSessions(webuiSessionsRaw, webuiReferenceRaw).length;
+  const renderedCliSessionCount=_renderSidebarRowsFromRawSessions(cliSessionsRaw, cliReferenceRaw).length;
+  const webuiSessionTabCount=_sessionSourceTabCount('webui', renderedWebuiSessionCount, renderedCliSessionCount);
+  const cliSessionTabCount=_sessionSourceTabCount('cli', renderedWebuiSessionCount, renderedCliSessionCount);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
   const list=$('sessionList');
   const animateRefresh=_sessionListRefreshAnimationPending;
@@ -5384,6 +5669,13 @@ function renderSessionListFromCache(){
   const committedSwipeReflowDelay=Math.max(0,committedSwipeDuration-SESSION_SWIPE_REFLOW_LEAD_MS);
   const listScrollTopBeforeRender=list.scrollTop||0;
   list.innerHTML='';
+  // #4671: belt-and-suspenders. The authoritative skeleton-clear happens in
+  // _applySessionListPayload (once fresh data is in hand) BEFORE this function is
+  // reached, and the guard at the top of renderSessionListFromCache bails while the
+  // flag is still true — so by the time we paint here the flag is already false. Keep
+  // this assignment as a defensive backstop for any future non-switch caller that
+  // reaches a real paint with the flag somehow still set.
+  _sessionListSkeletonActive=false;
   // Batch select bar (when in select mode)
   if(_sessionSelectMode){
     const selectBar=document.createElement('div');selectBar.className='session-select-bar';
@@ -5426,7 +5718,7 @@ function renderSessionListFromCache(){
     const sourceTabs=document.createElement('div');
     sourceTabs.className='session-source-tabs';
     for(const filter of ['webui','cli']){
-      const count=filter==='cli'?renderedCliSessionCount:renderedWebuiSessionCount;
+      const count=filter==='cli'?cliSessionTabCount:webuiSessionTabCount;
       const btn=document.createElement('button');
       btn.type='button';
       btn.className='session-source-tab'+(_sessionSourceFilter===filter?' active':'');

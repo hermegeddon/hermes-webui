@@ -1598,6 +1598,7 @@ def _session_list_cache_key(
     show_cron_sessions: bool,
     include_archived: bool = False,
     source_filter: str | None = None,
+    sidebar_source: str | None = None,
 ) -> tuple:
     return (
         _session_list_cache_profile_scope(active_profile),
@@ -1607,6 +1608,7 @@ def _session_list_cache_key(
         bool(show_cron_sessions),
         bool(include_archived),
         source_filter,
+        sidebar_source,
     )
 
 
@@ -1925,6 +1927,7 @@ def _build_session_list_cache_payload(
     show_cron_sessions: bool,
     include_archived: bool = False,
     source_filter: str | None = None,
+    sidebar_source: str | None = None,
     diag=None,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
@@ -2097,6 +2100,18 @@ def _build_session_list_cache_payload(
     )
     archived_count = archived_webui_count + archived_cli_count
     scoped = archived_scoped if include_archived else visible_scoped
+    webui_session_count = sum(
+        1 for s in scoped
+        if not _is_cli_session_for_settings(s)
+    )
+    cli_session_count = sum(
+        1 for s in scoped
+        if _is_cli_session_for_settings(s)
+    )
+    if sidebar_source == "webui":
+        scoped = [s for s in scoped if not _is_cli_session_for_settings(s)]
+    elif sidebar_source == "cli":
+        scoped = [s for s in scoped if _is_cli_session_for_settings(s)]
     if not include_archived:
         diag_stage("filter_archived_sessions")
     diag_stage("visible_lineage_metadata")
@@ -2110,6 +2125,8 @@ def _build_session_list_cache_payload(
         "archived_count": archived_count,
         "archived_webui_count": archived_webui_count,
         "archived_cli_count": archived_cli_count,
+        "webui_session_count": webui_session_count,
+        "cli_session_count": cli_session_count,
         "include_archived": include_archived,
         "all_profiles": all_profiles,
         "active_profile": active_profile,
@@ -2128,7 +2145,7 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     for s in runtime_rows:
         item = _sidebar_session_response_item(s) if isinstance(s, dict) else {}
         safe_merged.append(item)
-    return {
+    response = {
         "sessions": safe_merged,
         "cli_count": int(payload.get("cli_count", 0)),
         "archived_count": int(payload.get("archived_count", 0)),
@@ -2141,6 +2158,11 @@ def _session_list_payload_to_response(payload: dict) -> dict:
         "server_time": time.time(),
         "server_tz": time.strftime("%z"),
     }
+    if "webui_session_count" in payload:
+        response["webui_session_count"] = int(payload.get("webui_session_count", 0))
+    if "cli_session_count" in payload:
+        response["cli_session_count"] = int(payload.get("cli_session_count", 0))
+    return response
 
 
 def _get_cached_session_list_payload(
@@ -2622,6 +2644,21 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
             call["activitySegmentSeq"] = current_activity_burst_id
         tool_calls.append(call)
 
+    def reasoning_echo_tail_matches(text: str) -> bool:
+        candidate = _compact_for_echo_compare(text)
+        if not candidate:
+            return False
+        return _compact_for_echo_compare(reasoning_text).endswith(candidate)
+
+    def strip_reasoning_echo_tail(text: str) -> bool:
+        nonlocal reasoning_text, reasoning_first_tool_count
+        next_reasoning, did_remove = _strip_compact_echo_suffix(reasoning_text, text)
+        if did_remove:
+            reasoning_text = next_reasoning
+            if not _compact_for_echo_compare(reasoning_text):
+                reasoning_first_tool_count = None
+        return did_remove
+
     for event in events:
         event_name = str(event.get("event") or event.get("type") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -2641,6 +2678,8 @@ def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
         if event_name == "interim_assistant":
             visible = str(payload.get("text") or "").strip()
             if visible:
+                if payload.get("reasoning_echo") or reasoning_echo_tail_matches(visible):
+                    strip_reasoning_echo_tail(visible)
                 if payload.get("already_streamed"):
                     if not assistant_text:
                         assistant_text = visible
@@ -6631,6 +6670,8 @@ from api.streaming import (
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
+    _compact_for_echo_compare,
+    _strip_compact_echo_suffix,
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api.run_journal import (
@@ -9112,8 +9153,8 @@ def handle_get(handler, parsed) -> bool:
         # profile's (#3957). Without this, get_auth_status() probes on a
         # non-default profile resolve the wrong/empty creds and can stall past
         # the 30s frontend timeout. No-op for the default profile.
-        from api.profiles import profile_env_for_active_request
-        with profile_env_for_active_request("/api/providers", logger_override=logger):
+        from api.profiles import profile_env_for_active_request_readonly
+        with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
@@ -9129,8 +9170,8 @@ def handle_get(handler, parsed) -> bool:
         # read/write runs under the process-default profile, so a multi-profile
         # client would see (and seed) the default profile's pool instead of its
         # own (#4247/#4067 profile-isolation class).
-        from api.profiles import profile_env_for_active_request
-        with profile_env_for_active_request("/api/provider/quota", logger_override=logger):
+        from api.profiles import profile_env_for_active_request_readonly
+        with profile_env_for_active_request_readonly("/api/provider/quota", logger_override=logger):
             return j(handler, get_provider_quota(provider_id, refresh=refresh))
 
     if parsed.path == "/api/provider/cost-history":
@@ -9719,6 +9760,9 @@ def handle_get(handler, parsed) -> bool:
             active_profile = get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
             include_archived = _query_flag(parsed, "include_archived")
+            sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
+            if sidebar_source not in ("webui", "cli"):
+                sidebar_source = None
             key = _session_list_cache_key(
                 active_profile=active_profile,
                 all_profiles=all_profiles,
@@ -9727,6 +9771,7 @@ def handle_get(handler, parsed) -> bool:
                 show_cron_sessions=show_cron_sessions,
                 include_archived=include_archived,
                 source_filter=agent_session_source_filter,
+                sidebar_source=sidebar_source,
             )
             # Keep the visible /api/sessions contract unchanged even though the
             # heavy lifting now lives in the cache builder: profile scoping via
@@ -9742,6 +9787,7 @@ def handle_get(handler, parsed) -> bool:
                     show_cron_sessions=show_cron_sessions,
                     include_archived=include_archived,
                     source_filter=agent_session_source_filter,
+                    sidebar_source=sidebar_source,
                     diag=diag,
                 ),
                 diag=diag,
