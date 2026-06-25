@@ -3,6 +3,18 @@
 
 ## [Unreleased]
 
+## [v0.51.640] — 2026-06-25 — Release WU (faster profile switching — Claude Code transcript parses are cached)
+
+### Fixed
+
+- **Profile switching and sidebar loads are no longer dominated by re-parsing Claude Code transcripts.** On an installation with a large `~/.claude/projects` history, every `/api/sessions` build (which a profile switch triggers) re-read and JSON-parsed every Claude Code transcript file from scratch — line by line — just to recover each session's title and message count. On a 200-file / ~130MB tree that single step measured 650–1000ms and dominated the cold sidebar latency; because the directory is global but the higher session cache is keyed per active profile, it repeated in full on every switch, on the 5s CLI-cache expiry, and on every sidebar poll. The transcript parse is now memoized per file by its `(path, mtime, size)` signature, so a warm build re-stats the files (~4ms for 200) instead of re-parsing them, while any genuine edit or append transparently invalidates just that one file's entry. The redundant per-row `get_last_workspace()` call (which stats config + probes the terminal cwd) was also hoisted out of the Claude Code row loop. Measured cold-rebuild `/api/sessions` latency on a 250-session profile dropped from ~670–880ms to ~100–200ms. Output is byte-identical to the previous behavior. Thanks @rodboev for the browser-level profiling that isolated the real bottleneck. (#4718, #4662)
+
+## [v0.51.639] — 2026-06-25 — Release WT (approval cards can be dismissed and stay dismissed)
+
+### Fixed
+
+- **Dismissing an approval card now sticks across tab switches, polls, and restarts.** The 1.5s approval poll re-rendered the card whenever the server still reported a pending approval, so collapsing it was undone on the next tick and duplicate cards re-surfaced in every open tab after a reload. The card now has an explicit dismiss (✕) button, and dismissals are remembered in `localStorage` (capped, pruned when the approval resolves) so a card you dismissed stays gone. Dismissals are scoped per session, so dismissing one session's approval can't hide another session's still-pending approval that happens to share an id. Thanks @rodboev. (#4846, closes #4754)
+
 ## [v0.51.638] — 2026-06-25 — Release WS (faster session list — bounded continuation-fallback sidecar reads)
 
 ### Fixed
