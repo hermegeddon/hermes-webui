@@ -368,6 +368,41 @@ def test_boot_js_falls_back_to_browser_stt_when_server_transcribe_unavailable():
     assert "recognition=_ensureSpeechRecognition()" in js
 
 
+def test_voice_mode_can_use_server_stt_media_recorder_when_available():
+    """Hands-free voice mode must not be limited to browser SpeechRecognition input."""
+    js, _ = get_text("/static/boot.js")
+    assert "function _startMediaVoiceModeListening()" in js
+    assert "fetch('api/transcribe/capability'" in js
+    assert "fetch('api/transcribe',{method:'POST',body:form})" in js
+    assert "navigator.mediaDevices.getUserMedia({audio:true})" in js
+    assert "new MediaRecorder(" in js
+
+
+def test_voice_mode_support_gate_accepts_media_recorder_server_stt_path():
+    """Voice mode should be available when browser recording + server STT are available."""
+    js, _ = get_text("/static/boot.js")
+    assert "const _canVoiceRecordAudio=" in js
+    assert "const hasSTT=!!(SpeechRecognition||_canVoiceRecordAudio);" in js
+    assert "if(!hasSTT||!hasTTS) return;" in js
+    assert "const hasSTT=!(!SpeechRecognition);" not in js
+
+
+def test_voice_mode_deactivate_stops_media_capture():
+    """Turning off voice mode must stop any MediaRecorder stream/tracks."""
+    js, _ = get_text("/static/boot.js")
+    deactivate_idx = js.find("function _deactivate()")
+    assert deactivate_idx != -1
+    deactivate_body = js[deactivate_idx:js.find("  }", deactivate_idx) + 3]
+    assert "_stopVoiceMediaCapture()" in deactivate_body
+
+
+def test_voice_mode_settings_copy_mentions_server_stt_fallback():
+    """Settings copy should distinguish server STT input from browser/TTS output."""
+    i18n = pathlib.Path(__file__).parent.parent.joinpath("static/i18n.js").read_text(encoding="utf-8")
+    assert "Uses server speech-to-text when available" in i18n
+    assert "Requires a browser that supports both speech recognition and TTS." not in i18n
+
+
 def test_boot_js_keeps_explicit_server_stt_preference_on_transcribe_failure():
     """An explicit mic_force_mediarecorder='1' preference must not be silently overwritten."""
     js, _ = get_text("/static/boot.js")
