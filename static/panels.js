@@ -3982,6 +3982,7 @@ function _bucketDailyTokensForChart(rows) {
     const slice = rows.slice(i, i + bucketSize);
     const input_tokens = slice.reduce((s, r) => s + Number(r.input_tokens || 0), 0);
     const output_tokens = slice.reduce((s, r) => s + Number(r.output_tokens || 0), 0);
+    const cache_read_tokens = slice.reduce((s, r) => s + Number(r.cache_read_tokens || 0), 0);
     const sessions = slice.reduce((s, r) => s + Number(r.sessions || 0), 0);
     const cost = slice.reduce((s, r) => s + Number(r.cost || 0), 0);
 
@@ -3999,6 +4000,7 @@ function _bucketDailyTokensForChart(rows) {
       date: firstDate,
       input_tokens,
       output_tokens,
+      cache_read_tokens,
       sessions,
       cost,
     });
@@ -4059,7 +4061,13 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
         const outputPct = Math.max((output / maxDailyTokens) * 100, output ? 2 : 0).toFixed(1);
         const showLabel = idx === 0 || idx === chartRows.length - 1 || idx % labelEvery === 0;
         const titleDate = r.title || r.date;
-        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
+        const cacheRead = Number(r.cache_read_tokens || 0);
+        // Bounded daily cache hit rate: reads / (input + reads), 0-100%.
+        const cacheDenom = input + cacheRead;
+        const cacheStr = (cacheRead > 0 && cacheDenom > 0)
+          ? ` · ${Math.min(100, Math.round((cacheRead / cacheDenom) * 100))}% ${t('insights_model_cache')}`
+          : '';
+        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')}${cacheStr} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
         const labelText = r.label !== undefined ? r.label : String(r.date).slice(5);
         return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(labelText) : ''}</span></div>`;
       }).join('') +
@@ -4071,11 +4079,15 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
   // Models table
   let modelsHtml = '';
   if (d.models && d.models.length) {
-    modelsHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_models'))}</div><div class="insights-table insights-model-table"><div class="insights-table-head"><span>${esc(t('insights_model_name'))}</span><span>${esc(t('insights_model_sessions'))}</span><span>${esc(t('insights_model_tokens'))}</span><span>${esc(t('insights_model_cost'))}</span><span>${esc(t('insights_model_share'))}</span></div>` +
+    modelsHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_models'))}</div><div class="insights-table insights-model-table"><div class="insights-table-head"><span>${esc(t('insights_model_name'))}</span><span>${esc(t('insights_model_sessions'))}</span><span>${esc(t('insights_model_tokens'))}</span><span title="${esc(t('insights_cache_hit'))}">${esc(t('insights_model_cache'))}</span><span>${esc(t('insights_model_cost'))}</span><span>${esc(t('insights_model_share'))}</span></div>` +
       d.models.map(m => {
         const share = Number(m.cost_share || m.token_share || m.session_share || 0);
         const title = `${m.model} · ${fmtTokens(m.input_tokens)} ${t('insights_input_tokens')} · ${fmtTokens(m.output_tokens)} ${t('insights_output_tokens')}`;
-        return `<div class="insights-table-row"><span class="insights-model-name" title="${esc(m.model)}">${esc(m.model)}</span><span>${fmtNum(m.sessions)}</span><span class="insights-model-tokens" title="${esc(title)}">${fmtTokens(m.total_tokens || 0)}</span><span class="insights-model-cost">${fmtCost(m.cost)}</span><span>${share}%</span></div>`;
+        const cachePct = (m.cache_hit_percent === null || m.cache_hit_percent === undefined) ? null : Number(m.cache_hit_percent);
+        const cacheCell = cachePct === null
+          ? '<span class="insights-model-cache insights-model-cache-empty">—</span>'
+          : `<span class="insights-model-cache" title="${esc(t('insights_cache_hit'))}: ${fmtTokens(m.cache_read_tokens || 0)}">${cachePct}%</span>`;
+        return `<div class="insights-table-row"><span class="insights-model-name" title="${esc(m.model)}">${esc(m.model)}</span><span>${fmtNum(m.sessions)}</span><span class="insights-model-tokens" title="${esc(title)}">${fmtTokens(m.total_tokens || 0)}</span>${cacheCell}<span class="insights-model-cost">${fmtCost(m.cost)}</span><span>${share}%</span></div>`;
       }).join('') +
       `</div></div>`;
   } else {
@@ -7938,6 +7950,18 @@ async function loadSettingsPanel(){
     // TTS engine selector
     const ttsEngineSel=$('settingsTtsEngine');
     if(ttsEngineSel){
+      // Re-add any extension-registered TTS engines (window.registerHermesTtsEngine)
+      // as options — the <select> markup only hardcodes the built-ins, and this
+      // settings panel can render after an extension registered its engine.
+      if(typeof window._hermesTtsEngineOptions==='function'){
+        window._hermesTtsEngineOptions().forEach(function(e){
+          if(!ttsEngineSel.querySelector('option[value="'+e.id+'"]')){
+            var opt=document.createElement('option');
+            opt.value=e.id; opt.textContent=e.label;
+            ttsEngineSel.appendChild(opt);
+          }
+        });
+      }
       const saved=localStorage.getItem('hermes-tts-engine')||'browser';
       ttsEngineSel.value=saved;
       ttsEngineSel.onchange=function(){
@@ -8512,6 +8536,117 @@ function _extensionSafeHttpUrl(value){
   }
 }
 
+function _extensionRegistrySourceUrl(entryPath){
+  const raw=String(entryPath||'').trim();
+  if(!raw||raw.startsWith('/')||raw.includes('\\')||raw.includes('\0')) return '';
+  const parts=raw.split('/').filter(Boolean);
+  if(parts.length===0||parts.some(part=>part==='.'||part==='..')) return '';
+  const folder=parts.length>1?parts.slice(0,-1):parts;
+  return 'https://github.com/hermes-webui/hermes-webui-extensions/tree/main/'+folder.map(encodeURIComponent).join('/');
+}
+
+function _extensionSourceUrl(entry){
+  if(!entry||typeof entry!=='object') return '';
+  const candidates=[
+    entry.homepage,
+    entry.repository_url,
+    entry.repo_url,
+    entry.source_url,
+    entry.source,
+  ];
+  const repository=entry.repository;
+  if(typeof repository==='string'){
+    candidates.push(repository);
+  }else if(repository&&typeof repository==='object'){
+    candidates.push(repository.url,repository.html_url);
+  }
+  for(const candidate of candidates){
+    const safe=_extensionSafeHttpUrl(candidate);
+    if(safe) return safe;
+  }
+  return _extensionSafeHttpUrl(_extensionRegistrySourceUrl(entry.entry_path||entry.runtime_manifest_path));
+}
+
+function _extensionSourceLink(entry){
+  const url=_extensionSourceUrl(entry);
+  if(!url) return '';
+  return `<a class="extension-gallery-source-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Source</a>`;
+}
+
+function _extensionPermissionList(value){
+  if(!Array.isArray(value)) return '';
+  const items=value
+    .map(item=>String(item||'').trim())
+    .filter(Boolean);
+  return items.length?items.join(', '):'';
+}
+
+function _extensionPermissionRows(perms){
+  if(!perms||typeof perms!=='object') return [];
+  const rows=[];
+  const api=(perms.webui_api&&typeof perms.webui_api==='object')?perms.webui_api:{};
+  const apiRead=_extensionPermissionList(api.read);
+  const apiWrite=_extensionPermissionList(api.write);
+  if(apiRead) rows.push(['WebUI API reads',apiRead]);
+  if(apiWrite) rows.push(['WebUI API writes',apiWrite]);
+  if(perms.webui_navigation===true) rows.push(['Navigation','Can open or switch WebUI views']);
+
+  const sidecarCommands=(perms.sidecar_commands&&typeof perms.sidecar_commands==='object')?perms.sidecar_commands:{};
+  const commandLabels=[
+    ['from_loopback','accepts loopback commands'],
+    ['can_switch_sessions','switch sessions'],
+    ['can_write_drafts','write drafts'],
+    ['can_autosend','auto-send drafts'],
+    ['can_respond_approval','respond to approvals'],
+    ['can_respond_clarify','respond to clarifications'],
+  ];
+  const commands=commandLabels
+    .filter(([key])=>sidecarCommands[key]===true)
+    .map(([,label])=>label);
+  if(commands.length) rows.push(['Sidecar commands',commands.join(', ')]);
+
+  const dom=(perms.dom&&typeof perms.dom==='object')?perms.dom:{};
+  const domItems=[];
+  if(dom.owned===true) domItems.push('renders extension-owned UI');
+  if(dom.mutates_core_views===true) domItems.push('can alter core WebUI views');
+  if(domItems.length) rows.push(['DOM access',domItems.join(', ')]);
+
+  const storage=(perms.storage&&typeof perms.storage==='object')?perms.storage:{};
+  const ownedStorage=_extensionPermissionList(storage.owned||storage.owned_keys);
+  const sharedStorage=_extensionPermissionList(storage.shared_webui_keys);
+  if(ownedStorage) rows.push(['Owned storage keys',ownedStorage]);
+  if(sharedStorage) rows.push(['Shared WebUI storage',sharedStorage]);
+
+  if(perms.loopback_sidecar===true) rows.push(['Loopback sidecar','Can contact a declared local loopback helper']);
+  if(perms.native_host===true) rows.push(['Native host','Requires a local native host or desktop app']);
+
+  const filesystem=(perms.filesystem&&typeof perms.filesystem==='object')?perms.filesystem:{};
+  if(filesystem.arbitrary===true){
+    rows.push(['Filesystem','Can access arbitrary filesystem paths']);
+  }else if(filesystem.serves_bundled_assets===true){
+    rows.push(['Filesystem','Serves bundled extension assets only']);
+  }
+  if(perms.network_external===true||perms.external_network===true){
+    rows.push(['External network','Can contact external network origins']);
+  }
+  return rows;
+}
+
+function _extensionPermissionSummary(perms){
+  const rows=_extensionPermissionRows(perms);
+  const body=rows.length
+    ? '<div class="extension-gallery-permission-list">'+rows.map(([label,value])=>`
+      <div class="extension-gallery-permission-row">
+        <span class="extension-gallery-permission-label">${esc(label)}</span>
+        <span class="extension-gallery-permission-value">${esc(value)}</span>
+      </div>`).join('')+'</div>'
+    : `<div class="extension-gallery-permission-empty">${esc(t('ext_gallery_permissions_empty'))}</div>`;
+  return `<details class="extension-gallery-perms">
+    <summary>${esc(t('ext_gallery_permissions_show'))}</summary>
+    ${body}
+  </details>`;
+}
+
 function _extensionPostInstallNote(entry,isInstalled){
   const lifecycle=(entry&&entry.lifecycle&&typeof entry.lifecycle==='object')?entry.lifecycle:{};
   const post=(entry&&entry.post_install&&typeof entry.post_install==='object')?entry.post_install:null;
@@ -8592,7 +8727,14 @@ function _renderExtensionsGallery(entries,statusData){
     const isInstalled=installedIds.has(String(entry.id||''));
     const restartRequired=!!(entry.lifecycle&&(entry.lifecycle.restart_required||entry.lifecycle.webui_restart_required));
     const badgesHtml=caps.map(c=>`<span class="extension-gallery-badge">${esc(String(c))}</span>`).join('');
-    const permsHtml=perms?`<details class="extension-gallery-perms"><summary data-i18n="ext_gallery_permissions_show">Permissions</summary><pre>${esc(JSON.stringify(perms,null,2))}</pre></details>`:'';
+    const metaBits=[];
+    if(author) metaBits.push('by '+author);
+    if(version) metaBits.push('v'+version);
+    const sourceLinkHtml=_extensionSourceLink(entry);
+    const metaHtml=(metaBits.length||sourceLinkHtml)
+      ? `<div class="extension-gallery-meta">${metaBits.length?`<span>${metaBits.join(' · ')}</span>`:''}${sourceLinkHtml}</div>`
+      : '';
+    const permsHtml=perms?_extensionPermissionSummary(perms):'';
     const postInstallHtml=_extensionPostInstallNote(entry,isInstalled);
     const actionBtn=isInstalled
       ?`<button class="extension-gallery-uninstall-btn" data-ext-uninstall-id="${id}" type="button" data-i18n="ext_gallery_uninstall">Uninstall</button>`
@@ -8602,7 +8744,7 @@ function _renderExtensionsGallery(entries,statusData){
       <div class="extension-gallery-head">
         <div class="extension-gallery-info">
           <div class="extension-gallery-name">${name}${installedBadge}</div>
-          <div class="extension-gallery-meta">${author?'by '+author:''}${version?' · v'+version:''}</div>
+          ${metaHtml}
         </div>
       </div>
       <div class="extension-gallery-desc">${desc}</div>

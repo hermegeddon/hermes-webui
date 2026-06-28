@@ -35,7 +35,7 @@ def test_root_boot_distinguishes_url_session_from_localstorage_saved_session():
         "root `/` policy can differ from explicit `/session/<sid>` reload"
     )
     compact = block.replace(" ", "")
-    assert "letsaved=urlSession||savedLocal" in compact, (
+    assert "saved=urlSession||savedLocal" in compact, (
         "boot should still prefer explicit URL sessions over saved localStorage sessions"
     )
 
@@ -46,7 +46,7 @@ def test_root_saved_missing_session_is_cleared_after_authoritative_probe():
     compact = block.replace(" ", "")
     missing_guard = "!urlSession&&savedLocal&&_savedSessionWasMissingAfterProbe(savedLocal)"
     guard_pos = compact.find(missing_guard)
-    load_pos = block.find("await loadSession(saved)")
+    load_pos = block.find("await loadSession(saved")
     assert guard_pos >= 0, (
         "root `/` boot should clear saved localStorage IDs only after the "
         "missing_ok metadata probe reports the session missing"
@@ -90,14 +90,14 @@ def test_root_saved_running_session_is_checked_before_load_session_projection():
         "saved running-session root guard must run before loadSession(saved), "
         "otherwise loadSession already projects the session into the active pane"
     )
-    assert "_savedSessionShouldStaySidebarOnly" in block, (
+    assert "_savedSessionSidebarOnlyState" in block, (
         "boot should delegate the saved-running metadata check to a named helper"
     )
 
 
 def test_saved_running_session_helper_uses_metadata_only_and_runtime_markers():
-    """The helper should inspect cached list metadata before a non-404 missing_ok probe."""
-    helper_idx = BOOT_JS.find("async function _savedSessionShouldStaySidebarOnly")
+    """The helper should inspect cached metadata before a quiet metadata probe."""
+    helper_idx = BOOT_JS.find("async function _savedSessionSidebarOnlyState")
     assert helper_idx > 0, "saved-running root policy helper not found"
     helper = BOOT_JS[helper_idx:helper_idx + 1700]
     assert "_savedSessionListSnapshot(sid)" in helper, (
@@ -125,6 +125,14 @@ def test_saved_running_session_helper_uses_metadata_only_and_runtime_markers():
     assert "resolve_model=0" in helper, "helper must avoid unnecessary model resolution"
     assert "active_stream_id" in helper, "helper must treat active_stream_id as running"
     assert "pending_user_message" in helper, "helper must treat pending_user_message as running"
+    assert "session.archived" in helper, (
+        "helper must skip auto-opening archived localStorage sessions so root "
+        "boot lands on the empty state instead of reopening archived chats"
+    )
+    assert "sidebarOnly:archived||running" in helper.replace(" ", ""), (
+        "helper must report the sidebar-only decision without conflating archived "
+        "sessions with running sessions"
+    )
     assert "loadSession(" not in helper, (
         "helper must not call loadSession(), because that would already project "
         "the saved session into the active pane"
@@ -134,7 +142,7 @@ def test_saved_running_session_helper_uses_metadata_only_and_runtime_markers():
 def test_root_saved_running_sidebar_only_path_renders_empty_state_and_sidebar():
     """Skipping projection should still leave the app usable and sidebar visible."""
     block = _boot_saved_session_block()
-    helper_pos = block.find("_savedSessionShouldStaySidebarOnly")
+    helper_pos = block.find("_savedSessionSidebarOnlyState")
     render_pos = block.find("await renderSessionList()", helper_pos)
     empty_pos = block.find("$('emptyState').style.display=''", helper_pos)
     return_pos = block.find("return;", helper_pos)
@@ -142,3 +150,18 @@ def test_root_saved_running_sidebar_only_path_renders_empty_state_and_sidebar():
     assert empty_pos > helper_pos, "sidebar-only path must show the empty state"
     assert render_pos > helper_pos, "sidebar-only path must render the session list"
     assert return_pos > render_pos, "sidebar-only path should return before loadSession(saved)"
+
+
+def test_root_archived_saved_session_clears_stale_localstorage_pointer():
+    """Archived root-restore skips projection and clears stale saved-session state."""
+    block = _boot_saved_session_block()
+    helper_pos = block.find("_savedSessionSidebarOnlyState")
+    clear_guard = "if(savedSidebarOnlyState.archived)"
+    guard_pos = block.find(clear_guard, helper_pos)
+    clear_pos = block.find("localStorage.removeItem('hermes-webui-session')", guard_pos)
+    render_pos = block.find("await renderSessionList()", helper_pos)
+    load_pos = block.find("await loadSession(saved, {preserveActiveInput:true})")
+    assert guard_pos > helper_pos, "archived sidebar-only path must be distinguished"
+    assert clear_pos > guard_pos, "archived saved session must clear stale localStorage pointer"
+    assert clear_pos < render_pos, "stale pointer should be cleared before the sidebar-only return"
+    assert render_pos < load_pos, "archived saved session must return before loadSession(saved)"

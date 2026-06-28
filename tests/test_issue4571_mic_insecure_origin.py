@@ -110,5 +110,12 @@ def test_voice_mode_preflights_and_routes_permission_errors_through_shared_helpe
     )
     assert "_micOriginNeedsSecureContext()" in start_body
     assert "showToast(t('mic_insecure_origin'))" in start_body
-    assert "_micToastKeyForRecognitionError(event.error)" in start_body
-    assert "messageKey?t(messageKey):t('mic_error')+event.error" in start_body
+    assert "_startBrowserSpeechVoiceModeListening()" in start_body
+
+    browser_body = _slice_between(
+        BOOT_JS,
+        "function _startBrowserSpeechVoiceModeListening(){",
+        "\n  function _startListening(){",
+    )
+    assert "_micToastKeyForRecognitionError(event.error)" in browser_body
+    assert "messageKey?t(messageKey):t('mic_error')+event.error" in browser_body
