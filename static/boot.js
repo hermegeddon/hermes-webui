@@ -2042,6 +2042,9 @@ const _SKINS=[
   {name:'Ares',     colors:['#FF4444','#CC3333','#992222']},
   {name:'Mono',     colors:['#CCCCCC','#999999','#666666']},
   {name:'Graphite', colors:['#FFFFFF','#D6D6D6','#242424']},
+  {name:'GitHub', colors:['#0969DA','#1F883D','#242424']},
+  {name:'Codex', colors:['#72B39A','#242624','#ECEBE4']},
+  {name:'Terracotta', colors:['#D97757','#F0EEE6','#141413']},
   {name:'Slate',    colors:['#334155','#475569','#64748b']},
   {name:'Poseidon', colors:['#0EA5E9','#0284C7','#0369A1']},
   {name:'Sisyphus', colors:['#A78BFA','#8B5CF6','#7C3AED']},
@@ -2728,7 +2731,7 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
         localStorage.removeItem('hermes-webui-session');
         throw new Error('saved session missing');
       }
-      await loadSession(saved);
+      await loadSession(saved, {preserveActiveInput:true});
       // Hard refresh starts from the static HTML model list. Hydrate the live
       // catalog after the saved session is known, then re-apply that session's
       // model before S._bootReady lets syncModelChip reveal the composer label.
