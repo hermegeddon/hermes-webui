@@ -7236,6 +7236,7 @@ function _appearancePayloadFromUi(){
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
     auto_scroll_follow: !!($('settingsAutoScrollFollow')||{}).checked,
     render_user_markdown: !!($('settingsRenderUserMarkdown')||{}).checked,
+    large_text_paste_as_attachment: !!($('settingsLargeTextPasteAsAttachment')||{}).checked,
     ..._structuredCodeViewFromUi(),
     show_titlebar_profile: !!($('settingsShowTitlebarProfile')||{}).checked,
     worklog_details_expanded_default: worklogDetailsExpanded,
@@ -7325,6 +7326,7 @@ async function _autosaveAppearanceSettings(payload){
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
     window._autoScrollFollow=!saved||saved.auto_scroll_follow!==false;
+    window._largeTextPasteAsAttachment=!saved||saved.large_text_paste_as_attachment!==false;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'structured_code_default_view')){
       // Re-sync from the server-validated/clamped values so the UI and runtime
       // globals match exactly what was persisted.
@@ -7406,6 +7408,8 @@ function _preferencesPayloadFromUi(){
   // identically to the explicit saveSettings() path, so neither save route can
   // persist show_cron_sessions=true while show_cli_sessions=false. (#3514)
   if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
+  const showWebhookCb=$('settingsShowWebhookSessions');
+  if(showWebhookCb) payload.show_webhook_sessions=!!(showCliCb&&showCliCb.checked&&showWebhookCb.checked);
   const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
   if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
@@ -7430,6 +7434,8 @@ function _preferencesPayloadFromUi(){
   if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
   const busyInputModeSel=$('settingsBusyInputMode');
   if(busyInputModeSel) payload.busy_input_mode=busyInputModeSel.value;
+  const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
+  if(showBusyPlaceholderHintCb) payload.show_busy_placeholder_hint=showBusyPlaceholderHintCb.checked;
   const botNameField=$('settingsBotName');
   if(botNameField) payload.bot_name=botNameField.value;
   return payload;
@@ -7502,6 +7508,14 @@ async function _autosavePreferencesSettings(payload){
       window._showConversationOutline=!!(saved&&saved.show_conversation_outline);
       document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
       if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+    }
+    if(payload&&payload.busy_input_mode!==undefined){
+      window._busyInputMode=(saved&&saved.busy_input_mode)||'queue';
+      if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
+    }
+    if(payload&&payload.show_busy_placeholder_hint!==undefined){
+      window._showBusyPlaceholderHint=!!(saved&&saved.show_busy_placeholder_hint);
+      if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
     }
     _settingsPreferencesAutosaveRetryPayload=null;
     _setPreferencesAutosaveStatus('saved');
@@ -7663,6 +7677,15 @@ async function loadSettingsPanel(){
         window._renderUserMarkdown=this.checked;
         if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
         if(typeof renderMessages==='function') renderMessages();
+        _scheduleAppearanceAutosave();
+      };
+    }
+    const largeTextPasteCb=$('settingsLargeTextPasteAsAttachment');
+    if(largeTextPasteCb){
+      largeTextPasteCb.checked=settings.large_text_paste_as_attachment!==false;
+      window._largeTextPasteAsAttachment=largeTextPasteCb.checked;
+      largeTextPasteCb.onchange=function(){
+        window._largeTextPasteAsAttachment=this.checked;
         _scheduleAppearanceAutosave();
       };
     }
@@ -7903,6 +7926,13 @@ async function loadSettingsPanel(){
       showCronCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
       if(showCliCb){showCliCb.addEventListener('change',function(){showCronCb.disabled=!showCliCb.checked;},{once:false});}
     }
+    const showWebhookCb=$('settingsShowWebhookSessions');
+    if(showWebhookCb){
+      showWebhookCb.checked=!!settings.show_webhook_sessions;
+      showWebhookCb.disabled=showCliCb?!showCliCb.checked:true;
+      showWebhookCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      if(showCliCb){showCliCb.addEventListener('change',function(){showWebhookCb.disabled=!showCliCb.checked;},{once:false});}
+    }
     const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
     if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const syncCb=$('settingsSyncInsights');
@@ -8052,8 +8082,16 @@ async function loadSettingsPanel(){
     if(busyInputModeSel){
       const val=String(settings.busy_input_mode||'queue');
       busyInputModeSel.value=['queue','interrupt','steer'].includes(val)?val:'queue';
+      window._busyInputMode=busyInputModeSel.value;
       busyInputModeSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
+    const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
+    if(showBusyPlaceholderHintCb){
+      showBusyPlaceholderHintCb.checked=!!settings.show_busy_placeholder_hint;
+      window._showBusyPlaceholderHint=showBusyPlaceholderHintCb.checked;
+      showBusyPlaceholderHintCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+    }
+    if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
     // Bot name — debounced autosave (text input)
     const botNameField=$('settingsBotName');
     if(botNameField){
@@ -9951,13 +9989,14 @@ async function deletePasskey(id){
 }
 
 function _applySavedSettingsUi(saved, body, opts){
-  const {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
+  const {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize}=opts;
   window._sendKey=sendKey||'enter';
   window._showTokenUsage=showTokenUsage;
   window._showQuotaChip=showQuotaChip===true;
   window._showConversationOutline=showConversationOutline===true;
   document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
   if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
+  window._showBusyPlaceholderHint=showBusyPlaceholderHint===true;
   window._showTps=showTps;
   window._fadeTextEffect=!!fadeTextEffect;
   window._showCliSessions=showCliSessions;
@@ -9977,11 +10016,13 @@ function _applySavedSettingsUi(saved, body, opts){
   window._busyInputMode=body.busy_input_mode||'queue';
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._autoScrollFollow=body.auto_scroll_follow!==false;
+  window._largeTextPasteAsAttachment=body.large_text_paste_as_attachment!==false;
   if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
     _applyStructuredCodeViewSettings(body.structured_code_default_view,body.structured_code_auto_tree_lines,false);
   }
   window._botName=body.bot_name||'Hermes';
   if(typeof applyBotName==='function') applyBotName();
+  else if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
   if(typeof setLocale==='function') setLocale(language);
   if(typeof applyLocaleToDOM==='function') applyLocaleToDOM();
   const maxTokensField=$('settingsMaxTokens');
@@ -10523,6 +10564,7 @@ async function saveSettings(andClose){
   const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
+  const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
   const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
   const pw=($('settingsPassword')||{}).value;
@@ -10532,6 +10574,7 @@ async function saveSettings(andClose){
   const language=($('settingsLanguage')||{}).value||'en';
   const sidebarDensity=($('settingsSidebarDensity')||{}).value==='detailed'?'detailed':'compact';
   const busyInputMode=($('settingsBusyInputMode')||{}).value||'queue';
+  const showBusyPlaceholderHint=!!($('settingsShowBusyPlaceholderHint')||{}).checked;
   const body={};
 
   if(sendKey) body.send_key=sendKey;
@@ -10543,6 +10586,7 @@ async function saveSettings(andClose){
   body.chat_activity_display_mode=(($('settingsChatActivityDisplayMode')||{}).value==='transparent_stream')?'transparent_stream':'compact_worklog';
   body.auto_scroll_follow=!!($('settingsAutoScrollFollow')||{}).checked;
   body.render_user_markdown=!!($('settingsRenderUserMarkdown')||{}).checked;
+  body.large_text_paste_as_attachment=!!($('settingsLargeTextPasteAsAttachment')||{}).checked;
   Object.assign(body,_structuredCodeViewFromUi());
   body.language=language;
   body.show_token_usage=showTokenUsage;
@@ -10556,15 +10600,17 @@ async function saveSettings(andClose){
   }
   body.show_quota_chip=showQuotaChip===true;
   body.show_conversation_outline=showConversationOutline===true;
+  body.show_busy_placeholder_hint=showBusyPlaceholderHint===true;
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
   body.workspace_todos_tab=!!window._workspaceTodosTab;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
-  // Cron sessions are gated on CLI sessions (server short-circuits otherwise);
-  // mirror the autosave path so the explicit Save Settings button persists it too. (#3514)
+  // Cron and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
+  // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
+  body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
   body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
@@ -10602,7 +10648,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
-      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+      _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       const cpField=$('settingsCurrentPassword'); if(cpField) cpField.value='';
       const pwField=$('settingsPassword'); if(pwField) pwField.value='';
@@ -10632,7 +10678,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
-    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
+    _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showQuotaChip,showConversationOutline,showBusyPlaceholderHint,showTps,fadeTextEffect,showCliSessions,theme,skin,language,sidebarDensity,fontSize});
     showToast(t('settings_saved'));
     _settingsDirty=false;
     _resetSettingsPanelState();

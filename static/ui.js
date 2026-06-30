@@ -453,6 +453,9 @@ const _recycleResetAttrs=[
   'data-transparent-turn-toggle-bound',
   'data-anchor-scene-live-owner',
   'data-anchor-stream-id',
+  'data-latest-assistant-response',
+  'role',
+  'aria-label',
   // Defensive reset for legacy/restored shells that may still carry the fallback live-turn marker.
   'data-live-assistant-turn',
 ];
@@ -4038,6 +4041,7 @@ const MESSAGE_TOUCH_SCROLL_SUPPRESS_MS=1200;
 // post-render artifact suppression would swallow it for the whole window.
 const MESSAGE_WHEEL_INTENT_SUPPRESS_MS=1200;
 let _lastMessageWheelIntentMs=-Infinity;
+let _lastMessageScrollIntentMs=-Infinity;
 // #4970 review (greptile P1): keyboard scrolling of the message pane (PageUp/Down,
 // arrows, Space, Home/End) fires a native `scroll` event with NO wheel/touch/
 // scrollbar/non-message intent. Without recording it, a keyboard scroll-up inside
@@ -4064,6 +4068,13 @@ function _recentMessageTouchScrollIntent(){
 // true, otherwise a real gentle scroll-up right after a render gets swallowed.
 function _recentMessageWheelIntent(){
   return performance.now()-_lastMessageWheelIntentMs<MESSAGE_WHEEL_INTENT_SUPPRESS_MS;
+}
+function _recentMessageScrollIntent(){
+  // This manual-reader snapshot signal intentionally excludes the raw
+  // touch/key recency helpers: those also record near-tail events for render
+  // artifact suppression. Only this timestamp is guarded by bottom distance.
+  return performance.now()-_lastMessageScrollIntentMs<MESSAGE_WHEEL_INTENT_SUPPRESS_MS
+    || (typeof _scrollbarDragActive!=='undefined'&&!!_scrollbarDragActive);
 }
 // #4970 review (greptile P1): true when the reader recently used the keyboard to
 // scroll the message pane. Keyboard scrolls fire a native scroll event with no
@@ -4102,6 +4113,10 @@ function _recordNonMessageScrollIntent(e){
   // suppression consults _recentMessageWheelIntent() so it cannot swallow a real
   // gentle scroll-up. This does NOT unpin on its own — only the <-30 branch and
   // the scroll listener's movedUp branch flip _messageUserUnpinned.
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
+    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+    if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
+  }
   if(typeof e.deltaY==='number'&&e.deltaY<0) _lastMessageWheelIntentMs=performance.now();
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)){
     _cancelBottomSettle();
@@ -4197,6 +4212,7 @@ function _resetScrollDirectionTracker(){
   // into the new chat's first post-render window — the artifact then isn't
   // suppressed, falls into movedUp, and falsely unpins live-follow.
   _lastMessageWheelIntentMs=-Infinity;
+  _lastMessageScrollIntentMs=-Infinity;
   // #4970 review (greptile P1): same hygiene for keyboard scroll intent.
   _lastMessageKeyScrollIntentMs=-Infinity;
   clearTimeout(_deferredOlderMessagesTimer);
@@ -4212,6 +4228,7 @@ function _resetStreamScrollFollow(){
   // gentle upward wheel within the prior 1200ms can under-suppress a genuine
   // no-intent render artifact and silently disable live follow for the new stream.
   _lastMessageWheelIntentMs=-Infinity;
+  _lastMessageScrollIntentMs=-Infinity;
   // #4970 review (greptile P1): same hygiene for keyboard scroll intent.
   _lastMessageKeyScrollIntentMs=-Infinity;
   _cancelBottomSettle();
@@ -4338,7 +4355,10 @@ if(typeof window!=='undefined'){
     // Count only when the message pane itself is the scroll target: it is focused,
     // contains the focus, or the pointer is over it (keyboard scroll w/o focus).
     if(a===el||el.contains(a)||el.matches(':hover')){
-      _lastMessageKeyScrollIntentMs=performance.now();
+      const now=performance.now();
+      _lastMessageKeyScrollIntentMs=now;
+      const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+      if(bottomDistance>120) _lastMessageScrollIntentMs=now;
     }
   },{capture:true,passive:true});
   let _scrollRaf=0;
@@ -6046,6 +6066,33 @@ function getComposerPrimaryAction(){
   return 'queue';
 }
 
+function _applyBusyComposerPlaceholder(){
+  const input=$('msg');
+  if(!input) return;
+  if(_compressionPlaceholderSaved!==null) return;
+  if(input.disabled) return;
+  if(_composerHasContent()) return;
+  const idlePlaceholder='Message '+assistantDisplayName()+'\u2026';
+  if(!window._showBusyPlaceholderHint||!S.busy){
+    input.placeholder=idlePlaceholder;
+    return;
+  }
+  const busyMode=window._busyInputMode||'queue';
+  const busyPlaceholderKey=busyMode==='interrupt'
+    ? 'composer_placeholder_busy_interrupt'
+    : busyMode==='steer'
+      ? 'composer_placeholder_busy_steer'
+      : 'composer_placeholder_busy_queue';
+  const busyPlaceholderFallback=busyMode==='interrupt'
+    ? 'Enter = interrupt | /queue | /background | /steer'
+    : busyMode==='steer'
+      ? 'Enter = steer | /queue | /background | /interrupt'
+      : 'Enter = queue | /interrupt | /background | /steer';
+  input.placeholder=typeof t==='function'
+    ? (t(busyPlaceholderKey)||busyPlaceholderFallback)
+    : busyPlaceholderFallback;
+}
+
 function _setComposerPrimaryButtonIcon(btn,action){
   // Queue/interrupt/steer icons are inline Lucide SVGs (ISC):
   // https://lucide.dev/icons/
@@ -6063,7 +6110,10 @@ function _setComposerPrimaryButtonIcon(btn,action){
 
 function updateSendBtn(){
   const btn=$('btnSend');
-  if(!btn) return;
+  if(!btn){
+    if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
+    return;
+  }
   const action=getComposerPrimaryAction();
   btn.dataset.action=action;
   btn.classList.toggle('stop',action==='stop');
@@ -6085,6 +6135,7 @@ function updateSendBtn(){
   btn.title=_btnTitle;
   btn.setAttribute('aria-label',_btnTitle);
   _setComposerPrimaryButtonIcon(btn,action);
+  if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
   // Single primary action button: while busy/no-draft it becomes the red Stop
   // action; while busy with a draft it reflects queue/interrupt/steer.
   btn.style.display='';
@@ -8617,6 +8668,24 @@ function _createAssistantTurn(tsTitle='', tpsText=''){
   row.innerHTML=`${_assistantRoleHtml(tsTitle, tpsText)}<div class="assistant-turn-blocks"></div>`;
   return row;
 }
+function _setLatestAssistantTurnLandmark(turn, isLatest){
+  if(!turn) return;
+  const label='Latest Hermes response';
+  if(isLatest){
+    if(typeof document!=='undefined'){
+      document.querySelectorAll('.assistant-turn[data-latest-assistant-response="true"]').forEach(el=>{
+        if(el!==turn) _setLatestAssistantTurnLandmark(el, false);
+      });
+    }
+    turn.setAttribute('role','region');
+    turn.setAttribute('aria-label',label);
+    turn.dataset.latestAssistantResponse='true';
+    return;
+  }
+  if(turn.getAttribute('role')==='region') turn.removeAttribute('role');
+  if(turn.getAttribute('aria-label')===label) turn.removeAttribute('aria-label');
+  delete turn.dataset.latestAssistantResponse;
+}
 function _assistantTurnBlocks(turn){
   return turn?turn.querySelector('.assistant-turn-blocks'):null;
 }
@@ -10028,6 +10097,7 @@ function _anchorSceneNodeForRow(row, opts){
 }
 function _anchorSceneTransparentNodeForRow(row, opts){
   const settled=!!(opts&&opts.settled);
+  const live=!!(opts&&opts.live);
   if(!row) return null;
   let node=null;
   const meta={
@@ -10079,10 +10149,14 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   }
   if(!node) return null;
   node.setAttribute('data-anchor-scene-row','1');
-  node.setAttribute('data-anchor-settled-scene-row','1');
+  if(settled) node.setAttribute('data-anchor-settled-scene-row','1');
+  if(live) node.setAttribute('data-anchor-live-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
+  if(opts&&opts.streamId) node.setAttribute('data-anchor-stream-id',String(opts.streamId));
+  if(opts&&opts.sessionId) node.setAttribute('data-session-id',String(opts.sessionId));
+  if(live) node.setAttribute('data-live-stream-owned','1');
   return node;
 }
 // Whitespace-insensitive compare so a scene prose row that IS the final answer
@@ -10259,6 +10333,9 @@ function _prepareLiveAnchorScrollRebuildGuard(scrollSnapshot){
 }
 function renderLiveAnchorActivityScene(streamId, scene, opts){
   opts=opts||{};
+  if(typeof isTransparentStream==='function'&&isTransparentStream()){
+    return _renderLiveAnchorActivitySceneTransparent(streamId,scene,opts);
+  }
   if(typeof isCompactWorklogMode==='function'&&!isCompactWorklogMode()) return false;
   if(!S.session||!S.activeStreamId) return false;
   if(opts.sessionId&&S.session.session_id!==opts.sessionId) return false;
@@ -10269,11 +10346,11 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   if(!turn){
     turn=_createAssistantTurn();
     turn.id='liveAssistantTurn';
-    if(S.session) turn.dataset.sessionId=S.session.session_id;
     $('msgInner').appendChild(turn);
   }
   turn.setAttribute('data-anchor-scene-live-owner','1');
   turn.setAttribute('data-anchor-stream-id',String(streamId||''));
+  // Re-stamp when reusing a turn restored or previously rendered in another mode.
   if(S.session) turn.dataset.sessionId=S.session.session_id;
   const blocks=_assistantTurnBlocks(turn);
   if(!blocks) return false;
@@ -10319,8 +10396,79 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
+function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
+  opts=opts||{};
+  if(!S.session||!S.activeStreamId) return false;
+  if(opts.sessionId&&S.session.session_id!==opts.sessionId) return false;
+  if(streamId&&S.activeStreamId!==streamId) return false;
+  const rows=_anchorSceneRowsForRendering(scene,{settled:false});
+  if(!rows.length) return false;
+  $('emptyState').style.display='none';
+  let turn=$('liveAssistantTurn');
+  if(!turn){
+    turn=_createAssistantTurn();
+    turn.id='liveAssistantTurn';
+    $('msgInner').appendChild(turn);
+  }
+  turn.setAttribute('data-anchor-scene-live-owner','1');
+  turn.setAttribute('data-anchor-stream-id',String(streamId||''));
+  turn.setAttribute('data-live-assistant-turn','1');
+  if(S.session) turn.dataset.sessionId=S.session.session_id;
+  const blocks=_assistantTurnBlocks(turn);
+  if(!blocks) return false;
+  const scrollSnapshot=_captureMessageScrollSnapshot();
+  const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
+  blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  // Clear every legacy live activity surface this renderer can replace. The
+  // anchor-scene rows are now the source of truth for visible live activity.
+  blocks.querySelectorAll(
+    '.live-worklog[data-live-worklog-shell="1"],'+
+    '.tool-worklog-group[data-live-tool-call-group="1"],'+
+    '.tool-call-group[data-live-tool-call-group="1"],'+
+    '.tool-card-row[data-live-tid],'+
+    '.agent-activity-thinking[data-live-thinking="1"],'+
+    '.transparent-event-row[data-live-tid],'+
+    '[data-live-stream-owned="1"],'+
+    '.interim-collapse-toggle'
+  ).forEach(el=>el.remove());
+  // Match the compact path: keep legacy live segments as hidden anchors so
+  // stream-owned metadata survives while the anchor scene owns visible activity.
+  blocks.querySelectorAll('[data-live-assistant="1"]').forEach(el=>{
+    el.classList.add('assistant-segment-worklog-source');
+    el.setAttribute('aria-hidden','true');
+    el.hidden=true;
+  });
+  const liveFooter=blocks.querySelector('#liveRunStatus');
+  let wrote=false;
+  for(const row of rows){
+    const node=_anchorSceneTransparentNodeForRow(row,{
+      live:true,
+      settled:false,
+      streamId:streamId||S.activeStreamId||'',
+      sessionId:S.session&&S.session.session_id,
+    });
+    if(!node) continue;
+    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(node,liveFooter);
+    else blocks.appendChild(node);
+    wrote=true;
+  }
+  if(wrote) _syncTransparentEventControls(turn);
+  if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
+  _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+  if(scrollRebuildGuard&&scrollRebuildGuard.release){
+    requestAnimationFrame(()=>{
+      scrollRebuildGuard.release();
+      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+    });
+  }
+  if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
+  return wrote;
+}
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
-  const scene=_projectLiveAnchorActivitySceneForStream(streamId,(opts&&opts.mode)||'compact_worklog');
+  const mode=(typeof isTransparentStream==='function'&&isTransparentStream())
+    ? 'transparent_stream'
+    : ((opts&&opts.mode)||'compact_worklog');
+  const scene=_projectLiveAnchorActivitySceneForStream(streamId,mode);
   if(!scene) return false;
   return renderLiveAnchorActivityScene(streamId,scene,{...(opts||{}),sessionId});
 }
@@ -10405,24 +10553,33 @@ function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx
 // renderMessages({preserveScroll:true}) call and cleared after the settled-scene
 // render pass; null at all other times.
 let _keepSettledWorklogOpenForStreamId=null;
-function _shouldKeepSettledWorklogOpenForPinnedFollow(streamId){
-  // Round 6 scroll-jump guard: while the reader is pinned at the live tail,
-  // collapsing the JUST-settled live worklog into a compact summary can shrink
-  // the transcript by hundreds of px at STREAM_DONE. The browser clamps scrollTop
-  // to the new max, which looks like a large backward jump even though pinned
-  // state is correct. Keep that one worklog open for pinned followers so the
-  // live->settled DOM swap is height-stable; unpinned readers still get compact
-  // settled worklogs and preserve their viewport normally. This intentionally
-  // wins over a transient user-collapsed live worklog while the reader remains
-  // pinned: avoiding the visible STREAM_DONE jump takes precedence for followers.
+function _shouldKeepSettledWorklogOpenForStreamSettle(streamId){
+  // Round 6 scroll-jump guard: collapsing the JUST-settled live worklog into a
+  // compact summary at STREAM_DONE shrinks the transcript by hundreds of px. The
+  // resulting backward jump hits readers in TWO positions, so keep that one
+  // worklog open for BOTH on the settle render — the live->settled DOM swap is
+  // then height-stable and there is no shrink for any scroll path to mishandle:
+  //
+  //  1. PINNED follower at the live tail: the shrink lowers scrollHeight, the
+  //     browser clamps scrollTop to the new max, and the viewport snaps upward
+  //     even though pin state is correct.
+  //  2. UNPINNED reader who scrolled UP to read inside the just-settled turn
+  //     (the mobile "往回大跳" report, #MOBILESCROLL follow-up): the worklog sits
+  //     ABOVE their viewport, so collapsing it pulls their content up to the top
+  //     of the turn. On desktop overflow-anchor:none + the JS snapshot restore
+  //     keep them put, but on mobile the CSS resting value is overflow-anchor:
+  //     auto AND _fixMobileScrollJank() flips an inline overflow-anchor:none over
+  //     the settle render — which is exactly the wrong state: native anchoring is
+  //     suppressed during the one frame the unpinned reader needs it to absorb
+  //     the above-viewport shrink, so the content leaps to the turn's top. Keeping
+  //     the worklog open removes the shrink entirely, which fixes it for every
+  //     device/anchor-mode combination instead of fighting the anchor engine.
+  //
   // SCOPING: the exception is gated on the one-shot token matching this turn's
   // stream id, so it applies ONLY to the turn that just settled — not to every
-  // historical settled worklog on every pinned re-render (which would defeat the
-  // compact-worklog default for past turns). Pin flags use the sticky pin state
-  // because during live DOM rebuilds the raw bottom distance can transiently
-  // exceed a threshold even for a pinned follower.
-  if(!streamId||_keepSettledWorklogOpenForStreamId!==streamId) return false;
-  return !!(_scrollPinned && !_messageUserUnpinned);
+  // historical settled worklog on every re-render (which would defeat the
+  // compact-worklog default for past turns).
+  return !!(streamId&&_keepSettledWorklogOpenForStreamId===streamId);
 }
 // One-shot token set/clear API used by the STREAM_DONE handler (messages.js):
 // arm the keep-open exception for exactly the turn that just settled, render,
@@ -10432,6 +10589,15 @@ function _armKeepSettledWorklogOpen(streamId){
 }
 function _disarmKeepSettledWorklogOpen(){
   _keepSettledWorklogOpenForStreamId=null;
+}
+// True while a just-settled worklog is being force-rendered open (between
+// _armKeepSettledWorklogOpen and _disarmKeepSettledWorklogOpen). renderMessages()
+// consults this so it does NOT write the forced-open DOM into _sessionHtmlCache:
+// the keep-open is a transient settle-frame device, and caching it would persist
+// the forced-open worklog across session switches / restores, silently overriding
+// a user-collapsed worklog. (#5260 gate-cert: keep-open must not leak into cache.)
+function _isKeepSettledWorklogOpenArmed(){
+  return _keepSettledWorklogOpenForStreamId!==null;
 }
 if(typeof window!=='undefined'){
   window._armKeepSettledWorklogOpen=_armKeepSettledWorklogOpen;
@@ -10459,11 +10625,20 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   });
   blocks.querySelectorAll('.tool-worklog-group:not([data-anchor-scene-owner="1"]),.tool-call-group:not([data-anchor-scene-owner="1"]),.agent-activity-thinking:not([data-anchor-scene-row="1"]),.wl-reason').forEach(el=>el.remove());
   const streamId=String(message._anchor_stream_id||scene.stream_id||scene.identity&&scene.identity.stream_id||'');
-  const keepSettledWorklogOpen=_shouldKeepSettledWorklogOpenForPinnedFollow(streamId);
+  const keepSettledWorklogOpen=_shouldKeepSettledWorklogOpenForStreamSettle(streamId);
   const activityKey=`anchor-scene:${rawIdx}`;
   if(streamId&&!_readActivityDisclosureState(activityKey)){
     _copyActivityDisclosureState(`live:${streamId}`, activityKey);
   }
+  // keepSettledWorklogOpen forces collapsed:false for the ONE height-stable settle
+  // render of the just-settled turn (no STREAM_DONE shrink jump) for both pinned
+  // followers AND unpinned mid-turn readers. The keep-open is made genuinely
+  // transient by the STREAM_DONE handler (messages.js): right after this render it
+  // disarms the token and runs a scroll-PRESERVING collapse pass, so a worklog the
+  // reader had manually collapsed returns to its copied disclosure state
+  // (_copyActivityDisclosureState above) without the jump. While the token is
+  // armed this forced-open DOM is also kept OUT of _sessionHtmlCache
+  // (_isKeepSettledWorklogOpenArmed), so it never persists across restores.
   const group=_anchorSceneWorklogGroup(blocks,{
     live:false,
     collapsed:!keepSettledWorklogOpen,
@@ -11606,13 +11781,18 @@ function _captureMessageScrollSnapshot(){
   const el=$('messages');
   if(!el) return null;
   const bottom=Math.max(0,el.scrollHeight-el.scrollTop-el.clientHeight);
+  const readerAwayFromBottom=bottom>250&&(
+    _messageUserUnpinned ||
+    _scrollPinned===false ||
+    (typeof _recentMessageScrollIntent==='function'&&_recentMessageScrollIntent())
+  );
   return {
     anchor:(typeof _captureMessageViewportAnchor==='function')?_captureMessageViewportAnchor():null,
     top:el.scrollTop,
     bottom,
     scrollHeight:el.scrollHeight,
-    pinned:_shouldFollowMessagesOnDomReplace(),
-    userUnpinned:_messageUserUnpinned,
+    pinned:readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace(),
+    userUnpinned:readerAwayFromBottom?true:_messageUserUnpinned,
   };
 }
 function _restorePinnedMessageScrollSnapshot(snapshot){
@@ -12214,6 +12394,13 @@ function renderMessages(options){
     }catch(e){}
   }
   const transparentToolResultsByTid=_transparentModeActive?_collectToolResultSnippetsByTid(S.messages):{};
+  const latestRenderedAssistantRawIdx=(()=>{
+    for(let i=renderVisWithIdx.length-1;i>=0;i--){
+      const entry=renderVisWithIdx[i];
+      if(entry&&entry.m&&entry.m.role==='assistant'&&!entry.m._live) return entry.rawIdx;
+    }
+    return -1;
+  })();
   // Windowed render loop replaces the legacy full loop:
   // for(let vi=0;vi<visWithIdx.length;vi++)
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
@@ -12401,6 +12588,7 @@ function renderMessages(options){
       currentAssistantTurn.dataset.recycleKey=rawIdx;
       inner.appendChild(currentAssistantTurn);
     }
+    _setLatestAssistantTurnLandmark(currentAssistantTurn, !m._live&&rawIdx===latestRenderedAssistantRawIdx);
     const seg=document.createElement('div');
     if(Array.isArray(orderedTransparentParts)&&orderedTransparentParts.length){
       const blocks=_assistantTurnBlocks(currentAssistantTurn);
@@ -13335,7 +13523,15 @@ function renderMessages(options){
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  // Skip caching while the just-settled keep-open token is armed: that render
+  // force-opens the settled worklog for height-stability, and caching it would
+  // persist the forced-open DOM across session switches / restores, overriding a
+  // user-collapsed worklog. The follow-up collapse pass (after disarm) produces
+  // the correct cacheable DOM on its own render. (#5260 gate-cert.) The typeof
+  // guard keeps standalone renderMessages() test harnesses (which don't define
+  // the helper) working — absent helper == not armed == cache normally.
+  const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
+  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){

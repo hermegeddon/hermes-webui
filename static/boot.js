@@ -2057,6 +2057,7 @@ function _largeTextPasteLineCount(text){
   return value.endsWith('\n')?lines.length-1:lines.length;
 }
 function _shouldAttachLargePastedText(text){
+  if(window._largeTextPasteAsAttachment===false)return false;
   const value=String(text||'');
   if(!value.trim())return false;
   return value.length>=LARGE_TEXT_PASTE_CHAR_THRESHOLD || _largeTextPasteLineCount(value)>=LARGE_TEXT_PASTE_LINE_THRESHOLD;
@@ -2530,6 +2531,7 @@ function applyBotName(){
   if(topbarTitle && (!S.session)) topbarTitle.textContent=name;
   const msg=$('msg');
   if(msg) msg.placeholder='Message '+name+'\u2026';
+  if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
 }
 
 const _COMPOSER_CONTROL_TOGGLE_DEFS=[
@@ -2663,8 +2665,10 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
       jsonChars:parseInt(s.inflight_state_max_json_chars||1500000,10)||1500000,
     };
     window._busyInputMode=(s.busy_input_mode||'queue');
+    window._showBusyPlaceholderHint=!!s.show_busy_placeholder_hint;
     window._sessionEndlessScrollEnabled=!!s.session_endless_scroll;
     window._autoScrollFollow=s.auto_scroll_follow!==false;
+    window._largeTextPasteAsAttachment=s.large_text_paste_as_attachment!==false;
     window._composerControlVisibility=_composerControlVisibilityFromSettings(s);
     window._showTitlebarProfile=!!s.show_titlebar_profile;
     _applyTitlebarProfileVisibility();
@@ -2784,6 +2788,7 @@ window._applyTitlebarProfileVisibility=_applyTitlebarProfileVisibility;
     window._sidebarDensity='compact';
     window._pinnedSessionsLimit=3;
     window._busyInputMode='queue';
+    window._showBusyPlaceholderHint=false;
     window._sessionEndlessScrollEnabled=false;
     window._autoScrollFollow=true;
     window._composerControlVisibility=_composerControlVisibilityFromSettings(null);

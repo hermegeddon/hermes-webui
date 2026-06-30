@@ -512,6 +512,100 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     return _profiles_match(session_profile, active_profile)
 
 
+def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
+    if not path:
+        return False
+    if method != "POST":
+        return False
+    # Import routes create/claim sessions before normal ownership exists, and
+    # chat/start has inline placeholder-retag rules that must run before the
+    # generic request-session guard.
+    return path in {
+        "/api/session/import",
+        "/api/session/import_cli",
+        "/api/chat/start",
+    }
+
+
+def _session_id_visible_to_request_profile(handler, sid, *, emit_error: bool = True) -> bool:
+    """Return whether ``sid`` belongs to the active profile."""
+    if not isinstance(sid, str) or not sid:
+        return True
+    if not is_safe_session_id(sid):
+        return True
+    try:
+        session = get_session(sid, metadata_only=True)
+    except KeyError:
+        return True
+    if not _session_visible_to_active_profile(getattr(session, "profile", None), handler):
+        if emit_error:
+            bad(handler, "Session not found", 404)
+        return False
+    return True
+
+
+def _stream_id_owner_session_id(stream_id: str | None) -> str | None:
+    """Resolve stream owner session_id via active-run registry first, fallback to journal."""
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return None
+    try:
+        with ACTIVE_RUNS_LOCK:
+            raw = (ACTIVE_RUNS or {}).get(stream_id)
+        if isinstance(raw, dict):
+            owner = str(raw.get("session_id") or "").strip()
+            if owner:
+                return owner
+    except Exception:
+        logger.debug("Failed reading ACTIVE_RUNS owner for stream %s", stream_id, exc_info=True)
+    try:
+        owner = stream_owner_session_id(stream_id)
+        if owner:
+            return owner
+    except Exception:
+        logger.debug("Failed reading registered owner for stream %s", stream_id, exc_info=True)
+    if not is_safe_session_id(stream_id):
+        return None
+    try:
+        summary = find_run_summary(stream_id)
+        if isinstance(summary, dict):
+            owner = str(summary.get("session_id") or "").strip()
+            return owner or None
+    except Exception:
+        logger.debug("Failed reading run summary for stream %s", stream_id, exc_info=True)
+    return None
+
+
+def _stream_id_visible_to_request_profile(
+    handler,
+    stream_id: str | None,
+    *,
+    emit_error: bool = True,
+) -> bool:
+    """Return whether the stream owner is visible to the request's profile."""
+    owner_session_id = _stream_id_owner_session_id(stream_id)
+    if not owner_session_id:
+        return True
+    return _session_id_visible_to_request_profile(handler, owner_session_id, emit_error=emit_error)
+
+
+def _guard_request_session_visibility(handler, parsed, body=None, method="GET") -> bool:
+    """Apply request session-profile visibility check to request-supplied IDs.
+
+    Covers top-level `session_id` in the query/body. Routes that accept session
+    IDs under other keys must enforce their own visibility checks.
+    """
+    method = str(method).upper()
+    if _request_session_visibility_exempt(method, getattr(parsed, "path", "")):
+        return True
+    sid = parse_qs(getattr(parsed, "query", "") or "").get("session_id", [None])[0]
+    if not _session_id_visible_to_request_profile(handler, sid):
+        return False
+    if isinstance(body, dict) and not _session_id_visible_to_request_profile(handler, body.get("session_id")):
+        return False
+    return True
+
+
 def _active_skills_dir() -> Path:
     """Return the skills directory for the request's active Hermes profile.
 
@@ -1708,6 +1802,7 @@ def _build_session_list_cache_payload(
     include_archived: bool = False,
     exclude_hidden: bool = False,
     visible_only: bool = False,
+    show_webhook_sessions: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
     archived_limit: int | None = None,
@@ -1765,6 +1860,7 @@ def _build_session_list_cache_payload(
     show_cli_sessions = bool(show_cli_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
+    show_webhook_sessions = bool(show_webhook_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
@@ -1854,6 +1950,7 @@ def _build_session_list_cache_payload(
             cli,
             represented_webui_ids,
             show_cron_sessions=show_cron_sessions,
+            show_webhook_sessions=show_webhook_sessions,
         )
     else:
         diag_stage("filter_webui_sessions")
@@ -1987,6 +2084,7 @@ def _build_session_list_cache_payload(
             "show_cli_sessions": show_cli_sessions,
             "show_previous_messaging_sessions": show_previous_messaging_sessions,
             "show_cron_sessions": show_cron_sessions,
+            "show_webhook_sessions": show_webhook_sessions,
         },
     }
 
@@ -2253,6 +2351,11 @@ from api.config import (
     MIME_MAP,
     MAX_FILE_BYTES,
     MAX_UPLOAD_BYTES,
+    ACTIVE_RUNS,
+    ACTIVE_RUNS_LOCK,
+    register_stream_owner,
+    stream_owner_session_id,
+    unregister_stream_owner,
     CHAT_LOCK,
     _get_session_agent_lock,
     SESSION_AGENT_LOCKS,
@@ -2531,9 +2634,15 @@ def _truncate_journal_snapshot_value(value, *, limit: int = 120):
     return value
 
 
-def _run_journal_live_snapshot(stream_id: str | None) -> dict | None:
+def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict | None:
     stream_id = str(stream_id or "").strip()
     if not stream_id:
+        return None
+    if handler is not None and not _stream_id_visible_to_request_profile(
+        handler,
+        stream_id,
+        emit_error=False,
+    ):
         return None
     summary = find_run_summary(stream_id)
     if not summary:
@@ -4313,7 +4422,7 @@ def _handle_session_anchor_scene(handler, body):
     return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
-def _get_or_materialize_session(sid: str):
+def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False):
     """Get a session, materializing from CLI/agent metadata if not in WebUI store.
 
     Mirrors the fallback logic in /api/session/archive (routes.py:~8530).
@@ -4332,6 +4441,21 @@ def _get_or_materialize_session(sid: str):
         # below (and the heuristic record-check would mis-trip on mock sessions).
         if getattr(s, "read_only", False):
             raise PermissionError("read-only imported session")
+        if refresh_cli_messages and getattr(s, "is_cli_session", False):
+            latest_messages = get_cli_session_messages(
+                sid,
+                profile=getattr(s, "profile", None),
+            )
+            current_messages = list(getattr(s, "messages", None) or [])
+            if (
+                latest_messages
+                and len(latest_messages) >= len(current_messages)
+                and _session_messages_have_prefix(latest_messages, current_messages)
+            ):
+                # Keep the stitched CLI transcript authoritative on the first
+                # WebUI continuation path without clobbering later divergent
+                # WebUI-owned turns.
+                s.messages = list(latest_messages)
         return s
     except KeyError:
         pass
@@ -7269,16 +7393,22 @@ def _is_duplicate_webui_state_projection(session: dict, represented_webui_ids: s
     return bool(_session_lineage_ids(session) & represented_webui_ids)
 
 
-def _dedupe_cli_sidebar_sessions_for_api(cli: list[dict], represented_webui_ids: set[str], *, show_cron_sessions: bool = False) -> list[dict]:
-    """Return CLI/state sidebar rows while preserving project-hidden cron rows.
+def _dedupe_cli_sidebar_sessions_for_api(
+    cli: list[dict],
+    represented_webui_ids: set[str],
+    *,
+    show_cron_sessions: bool = False,
+    show_webhook_sessions: bool = False,
+) -> list[dict]:
+    """Return state sidebar rows while preserving project-hidden background rows.
 
-    Agent-side cron sessions come from state.db rather than the WebUI session
-    store. They should stay hidden from the default sidebar, but project-assigned
-    messageful rows must remain in the `/api/sessions` payload with
-    `default_hidden` so the matching project chip can reveal them (#3134).
+    Agent-side cron and webhook sessions come from state.db rather than the WebUI
+    session store. They should stay hidden from the default sidebar, but
+    project-assigned messageful rows must remain in the `/api/sessions` payload
+    with `default_hidden` so the matching project chip can reveal them (#3134).
     """
     from api.models import (
-        _hide_from_default_sidebar as _cron_hide,
+        _hide_from_default_sidebar as _hide_background,
         _include_project_hidden_background_sidebar_sessions,
     )
 
@@ -7288,7 +7418,14 @@ def _dedupe_cli_sidebar_sessions_for_api(cli: list[dict], represented_webui_ids:
         and not _is_duplicate_webui_state_projection(s, represented_webui_ids)
         and is_cli_session_row_visible(s)
     ]
-    visible = [s for s in candidates if not _cron_hide(s, show_cron=show_cron_sessions)]
+    visible = [
+        s for s in candidates
+        if not _hide_background(
+            s,
+            show_cron=show_cron_sessions,
+            show_webhook=show_webhook_sessions,
+        )
+    ]
     return _include_project_hidden_background_sidebar_sessions(candidates, visible)
 
 
@@ -7454,6 +7591,7 @@ from api.models import (
     _active_stream_ids,
     _merge_session_display_metadata,
     _session_message_merge_key,
+    _session_messages_have_prefix,
     _session_message_visible_key,
     _message_timestamp_as_float,
     _is_empty_partial_activity_message,
@@ -9355,14 +9493,16 @@ def _run_lifecycle_health() -> dict:
     now = time.time()
     with _live_config.ACTIVE_RUNS_LOCK:
         runs = []
-        for stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
+        for _stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
             item = dict(raw or {})
+            item.pop("session_id", None)
+            item.pop("stream_id", None)
+            item.pop("workspace", None)
             started_at = item.get("started_at")
             try:
                 age = max(0.0, now - float(started_at))
             except Exception:
                 age = 0.0
-            item.setdefault("stream_id", stream_id)
             item["age_seconds"] = round(age, 1)
             runs.append(item)
         last_finished = _live_config.LAST_RUN_FINISHED_AT
@@ -10012,6 +10152,9 @@ def handle_get(handler, parsed) -> bool:
             handler.end_headers()
         return True
 
+    if parsed.path.startswith("/api/") and not _guard_request_session_visibility(handler, parsed, method="GET"):
+        return True
+
     # ── Insights / knowledge status ──
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
@@ -10606,7 +10749,7 @@ def handle_get(handler, parsed) -> bool:
                     )
                     if journal_active:
                         try:
-                            snapshot = _run_journal_live_snapshot(original_stream_id)
+                            snapshot = _run_journal_live_snapshot(original_stream_id, handler=handler)
                         except Exception:
                             logger.debug(
                                 "Failed to build runtime journal snapshot for %s",
@@ -10797,6 +10940,7 @@ def handle_get(handler, parsed) -> bool:
                 settings.get("show_previous_messaging_sessions")
             )
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
+            show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
@@ -10818,6 +10962,7 @@ def handle_get(handler, parsed) -> bool:
                 include_archived=include_archived,
                 exclude_hidden=exclude_hidden,
                 visible_only=True,
+                show_webhook_sessions=show_webhook_sessions,
                 source_filter=agent_session_source_filter,
                 sidebar_source=sidebar_source,
                 archived_limit=archived_limit,
@@ -10838,6 +10983,7 @@ def handle_get(handler, parsed) -> bool:
                     include_archived=include_archived,
                     exclude_hidden=exclude_hidden,
                     visible_only=True,
+                    show_webhook_sessions=show_webhook_sessions,
                     source_filter=agent_session_source_filter,
                     sidebar_source=sidebar_source,
                     archived_limit=archived_limit,
@@ -11025,6 +11171,8 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
+        if not _stream_id_visible_to_request_profile(handler, stream_id):
+            return True
         active = stream_id in STREAMS
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
         try:
@@ -11040,6 +11188,8 @@ def handle_get(handler, parsed) -> bool:
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not stream_id:
             return bad(handler, "stream_id required")
+        if not _stream_id_visible_to_request_profile(handler, stream_id):
+            return True
         from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
         if runtime_adapter_enabled():
@@ -11611,6 +11761,10 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
+    if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
+        if diag:
+            diag.finish()
+        return True
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
@@ -11742,6 +11896,8 @@ def handle_post(handler, parsed) -> bool:
         # ── Memory lifecycle: commit the previous session before starting a new one ──
         prev_session_id = body.get("prev_session_id")
         if prev_session_id:
+            if not _session_id_visible_to_request_profile(handler, prev_session_id):
+                return True
             try:
                 from api.session_lifecycle import commit_session_memory
                 from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
@@ -13010,6 +13166,7 @@ def handle_post(handler, parsed) -> bool:
             for k in (
                 "show_cli_sessions",
                 "show_cron_sessions",
+                "show_webhook_sessions",
                 "show_previous_messaging_sessions",
             )
         ):
@@ -13764,6 +13921,8 @@ def handle_patch(handler, parsed) -> bool:
     if not _check_csrf(handler):
         return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     body = read_body(handler)
+    if not _guard_request_session_visibility(handler, parsed, body=body, method="PATCH"):
+        return True
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_toggle(handler, name, body)
@@ -13782,6 +13941,8 @@ def handle_delete(handler, parsed) -> bool:
     if not _check_csrf(handler):
         return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
     body = read_body(handler)
+    if not _guard_request_session_visibility(handler, parsed, body=body, method="DELETE"):
+        return True
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_delete(handler, name)
@@ -13808,6 +13969,8 @@ def handle_put(handler, parsed) -> bool:
     if not _check_csrf(handler):
         return j(handler, {"error": "Cross-origin request rejected"}, status=403)
     body = read_body(handler)
+    if not _guard_request_session_visibility(handler, parsed, body=body, method="PUT"):
+        return True
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_update(handler, name, body)
@@ -14403,6 +14566,8 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
+    if not _stream_id_visible_to_request_profile(handler, stream_id):
+        return True
     stream = STREAMS.get(stream_id)
     if stream is None:
         if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
@@ -16028,9 +16193,22 @@ def _handle_session_sse_stream(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
 
+    # The (re)subscribing tab reports its last-known message_count via
+    # ?known_count=N so the on-subscribe self-heal can detect a server-initiated
+    # turn that started AND finished entirely inside this tab's SSE gap (see the
+    # "server-initiated turn finished during the gap" self-heal block below).
+    # Absent/blank/non-numeric => None ("tab didn't report", never triggers).
+    _known_count_raw = parse_qs(parsed.query).get("known_count", [""])[0]
+    try:
+        subscriber_known_count = int(_known_count_raw) if _known_count_raw != "" else None
+    except (TypeError, ValueError):
+        subscriber_known_count = None
+
     from api.background_process import (
         subscribe_to_session_channel,
         active_stream_id_for_session,
+        persisted_message_count_for_session,
+        should_emit_session_updated,
     )
 
     # Atomic get-or-create + subscribe under SESSION_CHANNELS_LOCK. Doing these
@@ -16115,6 +16293,35 @@ def _handle_session_sse_stream(handler, parsed):
                     "source": "subscribe_recovery",
                     "recovered": True,
                 })
+            else:
+                # ── Server-initiated turn that FINISHED during the SSE gap ──
+                # The block above only heals a turn that is live RIGHT NOW. But
+                # a server-initiated turn (self-wake / cron / restart hook) can
+                # start AND finish entirely inside the gap: the fire-and-forget
+                # `server_turn_started` reached no subscriber, and by the time
+                # this tab reconnects the run has already cleared from
+                # ACTIVE_RUNS — so active_stream_id_for_session returns None and
+                # nothing above replays. The turn IS persisted, but this tab's
+                # transcript stays stale until a hard refresh (the reported
+                # visible-tab defect). Detect it by comparing the persisted
+                # message_count against what this (re)subscribing tab last knew
+                # (?known_count). If the server is AHEAD, emit a lightweight
+                # `session-updated` frame so the tab does an INCREMENTAL,
+                # swap-in-place message sync (frontend reuses #5189's
+                # keepStaleUntilLoaded loadSession path — NO clear+refetch, so
+                # the #5177/#5189 blank-gap jump is not reintroduced). Carries
+                # only counts (no transcript) to stay cheap. Skipped
+                # entirely when the tab didn't report a count or the persisted
+                # count is unknown (legacy sidecar) → never a spurious reload.
+                if subscriber_known_count is not None:
+                    persisted_count = persisted_message_count_for_session(sid)
+                    if should_emit_session_updated(subscriber_known_count, persisted_count):
+                        _sse(handler, 'session-updated', {
+                            "session_id": sid,
+                            "message_count": persisted_count,
+                            "known_count": subscriber_known_count,
+                            "source": "subscribe_recovery",
+                        })
         except _CLIENT_DISCONNECT_ERRORS:
             # Client vanished mid-recovery — re-raise so the outer handler
             # treats it as a normal disconnect and the finally still cleans up.
@@ -17056,6 +17263,7 @@ def _handle_btw(handler, body):
     ephemeral.active_stream_id = stream_id
     ephemeral.save()
     stream = create_stream_channel()
+    register_stream_owner(stream_id, ephemeral.session_id)
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     from api.background import track_btw
@@ -17102,6 +17310,7 @@ def _handle_background(handler, body):
     bg.active_stream_id = stream_id
     bg.save()
     stream = create_stream_channel()
+    register_stream_owner(stream_id, bg.session_id)
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     task_id = uuid.uuid4().hex[:8]
@@ -17356,6 +17565,10 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
                 return stream_id
             for stale_stream_id in stale_stream_ids:
                 (_live_config.ACTIVE_RUNS or {}).pop(stale_stream_id, None)
+                # The zombie run is pruned directly here (not via the normal teardown
+                # finally / unregister_active_run), so release its stream-owner entry too
+                # or STREAM_SESSION_OWNERS leaks for every reconciled zombie. (#5198 gate)
+                unregister_stream_owner(stale_stream_id)
     except Exception:
         return None
     return None
@@ -17487,6 +17700,7 @@ def _start_chat_stream_for_session(
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
     stream = create_stream_channel()
+    register_stream_owner(stream_id, s.session_id)
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
@@ -17495,9 +17709,7 @@ def _start_chat_stream_for_session(
     diag.stage("worker_thread_start") if diag else None
     backend_is_gateway = webui_gateway_chat_enabled(get_config())
     worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider}
-    if not backend_is_gateway:
-        worker_kwargs["goal_related"] = goal_related
+    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
     if moa_config and not backend_is_gateway:
         worker_kwargs["moa_config"] = moa_config
     thr = threading.Thread(
@@ -17989,7 +18201,7 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, str(e))
         diag.stage("get_session") if diag else None
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)
         except KeyError:
             # No WebUI sidecar. If this is a foreign-origin session (CLI,
             # TUI, Desktop) with recoverable state.db messages, claim it by
@@ -18055,6 +18267,7 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "Read-only imported sessions cannot be continued from WebUI", 403)
         diag.stage("validate_profile") if diag else None
         requested_profile = str(body.get("profile") or "").strip()
+        active_profile = _get_active_profile_name()
         if requested_profile:
             try:
                 from api.profiles import _PROFILE_ID_RE
@@ -18063,18 +18276,23 @@ def _handle_chat_start(handler, body, diag=None):
                     return bad(handler, "invalid profile", 400)
             except ImportError:
                 requested_profile = ""
-        if requested_profile and not _profiles_match(getattr(s, "profile", None), requested_profile):
-            has_persisted_turns = bool(
-                getattr(s, "messages", None)
-                or getattr(s, "context_messages", None)
-                or getattr(s, "pending_user_message", None)
-            )
-            if not has_persisted_turns:
-                # Empty sessions are placeholders. If the user switches profiles
-                # before sending the first turn, run the placeholder under the
-                # currently-selected profile instead of the stale one stamped at
-                # creation time.
+        session_profile = getattr(s, "profile", None)
+        has_persisted_turns = bool(
+            getattr(s, "messages", None)
+            or getattr(s, "context_messages", None)
+            or getattr(s, "pending_user_message", None)
+        )
+        if not _session_visible_to_active_profile(session_profile, handler):
+            if (
+                requested_profile
+                and _profiles_match(requested_profile, active_profile)
+                and not has_persisted_turns
+            ):
+                # Empty placeholders can still be retagged when the
+                # requested profile matches the active request profile.
                 s.profile = requested_profile
+            else:
+                return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
         if not msg:
