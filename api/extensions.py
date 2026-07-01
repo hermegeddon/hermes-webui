@@ -872,6 +872,47 @@ def _gallery_installed_runtime_manifest(
     return {"extensions": entries}
 
 
+def _gallery_entries_for_manifest_merge(gallery_manifest: Optional[object]) -> List[Dict[str, object]]:
+    """Return gallery entries safe to append to a configured manifest.
+
+    Gallery manifests normally run with an empty manifest asset base. If an
+    administrator configures ``HERMES_WEBUI_EXTENSION_MANIFEST`` in a subdirectory,
+    the configured manifest's asset base applies to every relative asset in the
+    combined manifest. Convert gallery asset paths to absolute ``/extensions/...``
+    URLs before appending so they still resolve from their own package directory,
+    not from the configured manifest file's directory.
+    """
+    entries: List[Dict[str, object]] = []
+    for _source, _index, entry in _manifest_extension_entries(gallery_manifest):
+        copied = dict(entry)
+        for key in ("scripts", "stylesheets"):
+            values = copied.get(key)
+            if isinstance(values, list):
+                copied[key] = [_manifest_asset_url(value, "") for value in values]
+        entries.append(copied)
+    return entries
+
+
+def _merge_gallery_installs_into_manifest(
+    manifest: object, gallery_manifest: Optional[object]
+) -> object:
+    """Append gallery-installed extensions to a configured runtime manifest."""
+    gallery_entries = _gallery_entries_for_manifest_merge(gallery_manifest)
+    if not gallery_entries:
+        return manifest
+    if isinstance(manifest, list):
+        return list(manifest) + gallery_entries
+    if isinstance(manifest, dict):
+        merged = dict(manifest)
+        configured_entries = merged.get("extensions")
+        if isinstance(configured_entries, list):
+            merged["extensions"] = list(configured_entries) + gallery_entries
+        else:
+            merged["extensions"] = gallery_entries
+        return merged
+    return manifest
+
+
 def _load_manifest_with_status(
     root: Path, diagnostics: Optional[Dict[str, Any]] = None
 ) -> Tuple[Optional[object], Dict[str, Any]]:
@@ -900,6 +941,9 @@ def _load_manifest_with_status(
             _add_diagnostic_warning(diagnostics, "manifest_missing", "manifest")
             return None, manifest_status
         manifest = json.loads(_read_manifest_text(manifest_file))
+        manifest = _merge_gallery_installs_into_manifest(
+            manifest, _gallery_installed_runtime_manifest(root, diagnostics)
+        )
         manifest_status.update(
             {
                 "loaded": True,

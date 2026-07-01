@@ -125,6 +125,14 @@ may be kept in the manifest with the JSON boolean `"enabled": false`. Explicit
 `HERMES_WEBUI_EXTENSION_STYLESHEET_URLS` still work and are appended after
 manifest assets, with duplicates ignored.
 
+If `HERMES_WEBUI_EXTENSION_MANIFEST` is configured and gallery extensions are
+also installed into the same extension root, WebUI merges the configured manifest
+with the gallery-installed package manifests. This lets an administrator keep a
+local manifest for development-only assets while Settings -> Extensions installs
+continue to load from their package `manifest.json` files. Duplicate extension
+ids keep the first manifest entry and are reported as manifest duplicate-id
+warnings in diagnostics.
+
 When an extension is installed from Settings -> Extensions, WebUI records the
 installed package and loads that package's `manifest.json` automatically on the
 next app-shell render. In this gallery-installed mode, a manifest located at

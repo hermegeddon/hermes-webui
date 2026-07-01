@@ -148,6 +148,87 @@ def test_gallery_installed_extension_becomes_runtime_manifest(monkeypatch, tmp_p
     assert status["extensions"][0]["id"] == "my-ext"
 
 
+def test_gallery_installed_extension_merges_with_configured_manifest(monkeypatch, tmp_path):
+    """An explicit local manifest and gallery-installed packages both load."""
+    ext_dir, state_dir = _setup_ext_env(monkeypatch, tmp_path)
+    (ext_dir / "extensions.json").write_text(
+        json.dumps(
+            {
+                "extensions": [
+                    {
+                        "id": "local-ext",
+                        "name": "Local Extension",
+                        "scripts": ["local/app.js"],
+                        "stylesheets": ["local/app.css"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_MANIFEST", "extensions.json")
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", raising=False)
+    import api.extensions as ext_mod
+
+    files = {
+        "my-ext/manifest.json": json.dumps(
+            {
+                "version": "1.0.0",
+                "extensions": [
+                    {
+                        "id": "my-ext",
+                        "name": "My Extension",
+                        "scripts": ["assets/app.js"],
+                        "stylesheets": ["assets/app.css"],
+                    }
+                ],
+            }
+        ),
+        "my-ext/assets/app.js": "console.log('gallery runtime');",
+        "my-ext/assets/app.css": "body{}",
+    }
+    zip_bytes = _make_zip(files)
+    sha = hashlib.sha256(zip_bytes).hexdigest()
+    monkeypatch.setattr(ext_mod, "_safe_download", lambda *a, **kw: zip_bytes)
+
+    ext_mod.install_extension(
+        "my-ext",
+        "https://hermes-webui.github.io/exts/my-ext.zip",
+        sha,
+    )
+
+    assert ext_mod.get_extension_config() == {
+        "enabled": True,
+        "script_urls": [
+            "/extensions/local/app.js",
+            "/extensions/my-ext/assets/app.js",
+        ],
+        "stylesheet_urls": [
+            "/extensions/local/app.css",
+            "/extensions/my-ext/assets/app.css",
+        ],
+        "extensions": [
+            {
+                "id": "local-ext",
+                "name": "Local Extension",
+                "storage_owned": False,
+                "settings_schema": [],
+            },
+            {
+                "id": "my-ext",
+                "name": "My Extension",
+                "storage_owned": False,
+                "settings_schema": [],
+            },
+        ],
+    }
+    status = ext_mod.get_extension_status()
+    assert status["manifest"]["status"] == "loaded"
+    assert status["counts"]["manifest_extensions"] == 2
+    assert [entry["id"] for entry in status["extensions"]] == ["local-ext", "my-ext"]
+
+
 def test_gallery_installed_settings_only_manifest_becomes_runtime_entry(monkeypatch, tmp_path):
     """Settings-only gallery installs still surface in status and runtime config."""
     ext_dir, state_dir = _setup_ext_env(monkeypatch, tmp_path)
