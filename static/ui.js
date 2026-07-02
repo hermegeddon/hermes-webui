@@ -10824,7 +10824,26 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   if(!blocks) return false;
   const scrollSnapshot=_captureMessageScrollSnapshot();
   const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
-  blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  const activeStreamId = String(streamId || S.activeStreamId || '');
+  const activeSessionId = String(S.session && S.session.session_id || '');
+  const preserveByKey = new Map();
+  blocks.querySelectorAll('.transparent-event-row[data-live-stream-owned="1"][data-anchor-row-id]').forEach(node=>{
+    if(!node||!node.getAttribute) return;
+    const rowStream = String(node.getAttribute('data-anchor-stream-id') || '');
+    if(rowStream && rowStream !== activeStreamId) return;
+    const rowSession = String(node.getAttribute('data-session-id') || '');
+    if(rowSession && activeSessionId && rowSession !== activeSessionId) return;
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    if(key && !preserveByKey.has(key)) preserveByKey.set(key, node);
+  });
+  blocks.querySelectorAll('[data-anchor-scene-owner="1"]').forEach(el=>el.remove());
+  blocks.querySelectorAll('[data-anchor-scene-row="1"]').forEach(el=>{
+    if(el.getAttribute('data-live-stream-owned') === '1'){
+      const key = _transparentLiveRowKey(el, activeStreamId);
+      if(key && preserveByKey.get(key) === el) return;
+    }
+    el.remove();
+  });
   // Clear every legacy live activity surface this renderer can replace. The
   // anchor-scene rows are now the source of truth for visible live activity.
   blocks.querySelectorAll(
@@ -10834,7 +10853,6 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     '.tool-card-row[data-live-tid],'+
     '.agent-activity-thinking[data-live-thinking="1"],'+
     '.transparent-event-row[data-live-tid],'+
-    '[data-live-stream-owned="1"],'+
     '.interim-collapse-toggle'
   ).forEach(el=>el.remove());
   // Match the compact path: keep legacy live segments as hidden anchors so
@@ -10854,10 +10872,18 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       sessionId:S.session&&S.session.session_id,
     });
     if(!node) continue;
-    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(node,liveFooter);
-    else blocks.appendChild(node);
+    const key = _transparentLiveRowKey(node, activeStreamId);
+    const existing = key ? preserveByKey.get(key) : null;
+    const renderedNode = existing && _transparentLiveRowsCompatible(existing, node)
+      ? _refreshTransparentLiveRow(existing, node)
+      : node;
+    if(existing) preserveByKey.delete(key);
+    if(!renderedNode) continue;
+    if(liveFooter&&liveFooter.parentElement===blocks) blocks.insertBefore(renderedNode,liveFooter);
+    else blocks.appendChild(renderedNode);
     wrote=true;
   }
+  preserveByKey.forEach(stale=>stale.remove());
   if(wrote) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
@@ -10869,6 +10895,100 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return wrote;
+}
+
+function _transparentLiveRowKey(node, streamId){
+  if(!node || !node.getAttribute) return '';
+  const rowId = String(node.getAttribute('data-anchor-row-id') || '').trim();
+  if(!rowId) return '';
+  const rowStreamId = String(streamId || node.getAttribute('data-anchor-stream-id') || '').trim();
+  const rowRole = String(node.getAttribute('data-anchor-row-role') || 'activity').trim();
+  const rowSource = String(node.getAttribute('data-anchor-source-event-type') || '').trim();
+  return `${rowStreamId}\u0000${rowId}\u0000${rowRole}\u0000${rowSource}`;
+}
+
+function _transparentLiveRowsCompatible(existing, candidate){
+  if(!existing || !candidate) return false;
+  return !!(
+    existing.getAttribute('data-anchor-row-id') === candidate.getAttribute('data-anchor-row-id') &&
+    existing.getAttribute('data-anchor-row-role') === candidate.getAttribute('data-anchor-row-role') &&
+    existing.getAttribute('data-anchor-source-event-type') === candidate.getAttribute('data-anchor-source-event-type')
+  );
+}
+
+function _transparentLiveRowAttributePairs(node){
+  if(!node) return [];
+  if(typeof node.getAttributeNames === 'function'){
+    return node.getAttributeNames().map(name=>[name, node.getAttribute(name)]);
+  }
+  const attrs = node.attributes;
+  if(!attrs || typeof attrs !== 'object') return [];
+  if(typeof attrs.length === 'number'){
+    const pairs = [];
+    for(let i=0;i<attrs.length;i++){
+      const attr = typeof attrs.item === 'function' ? attrs.item(i) : attrs[i];
+      if(!attr || !attr.name) continue;
+      pairs.push([attr.name, attr.value]);
+    }
+    return pairs;
+  }
+  return Object.keys(attrs).map(name=>[name, attrs[name]]);
+}
+
+function _transparentLiveRowInteractiveState(row){
+  const card = row&&row.querySelector ? row.querySelector('.tool-card,.thinking-card') : null;
+  const detail = row&&row.querySelector ? row.querySelector('.tool-card-detail') : null;
+  return {
+    expanded: !!((card&&card.classList&&card.classList.contains('open')) || (row&&row.getAttribute&&row.getAttribute('data-expanded')==='1')),
+    detailMode: detail&&detail.getAttribute ? String(detail.getAttribute('data-transparent-detail-mode') || '') : '',
+  };
+}
+
+function _rehydrateTransparentLiveRow(existing, node, preservedState){
+  if(!existing) return;
+  if(node && Object.prototype.hasOwnProperty.call(node, '_tcData')) existing._tcData = node._tcData;
+  else if(Object.prototype.hasOwnProperty.call(existing, '_tcData')) delete existing._tcData;
+  const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
+  if(header){
+    if(typeof _wireTransparentHeaderToggle === 'function') _wireTransparentHeaderToggle(header);
+    if(typeof _attachCopyButton === 'function') _attachCopyButton(header);
+  }
+  const card = existing.querySelector ? existing.querySelector('.tool-card,.thinking-card') : null;
+  if(card){
+    if(typeof _setTransparentCardOpen === 'function') _setTransparentCardOpen(card, !!(preservedState&&preservedState.expanded));
+    else if(card.classList&&typeof card.classList.toggle === 'function') card.classList.toggle('open', !!(preservedState&&preservedState.expanded));
+  }
+  const detail = existing.querySelector ? existing.querySelector('.tool-card-detail') : null;
+  if(detail && preservedState && preservedState.detailMode){
+    detail.setAttribute('data-transparent-detail-mode', preservedState.detailMode);
+    detail.querySelectorAll('.transparent-detail-mode').forEach(el=>{
+      const mode = String(el.getAttribute('data-mode') || '');
+      if(el.classList && typeof el.classList.toggle === 'function') el.classList.toggle('active', mode===preservedState.detailMode);
+    });
+  }
+}
+
+function _refreshTransparentLiveRow(existing, node){
+  if(!existing || !node || !existing.getAttribute) return node;
+  if(existing===node) return existing;
+  const preservedState = _transparentLiveRowInteractiveState(existing);
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  existing.innerHTML = node.innerHTML || '';
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
 }
 function _renderLiveAnchorActivitySceneForStream(streamId, sessionId, opts){
   const mode=(typeof isTransparentStream==='function'&&isTransparentStream())
@@ -12272,18 +12392,133 @@ function _restoreMessageScrollSnapshot(snapshot){
  * Chromium cannot re-anchor to the topmost row during the innerHTML=''
  * wipe-and-rebuild gap. The rAF callback restores CSS default afterward.
  */
+// Mobile scroll jump-back root fix. On touch devices #messages rests at
+// overflow-anchor:auto, so the browser's native scroll-anchoring engine
+// re-compensates scrollTop in the LAYOUT phase whenever content above the
+// viewport changes height — worklog live→settled collapse, tool-card inserts,
+// media/katex reflow, virtual-scroll topPad recompute, the STREAM_DONE
+// multi-render sequence. That compensation happens in the browser's layout step,
+// INDEPENDENT of which frame our JS wrote scrollTop in, so per-write suppression
+// (a single-rAF guard) could not reach it: the collapse/reflow lands a frame or
+// two later, after the guard already released. Real mobile flight-recorder data
+// (captured jumps with dTop -101/+350/+748/-400, call stack = rAF sampler only =
+// NO JS frame) confirmed the compensation is the browser engine, not our scroll
+// writes.
+//
+// Fix: DEFER the restore AND track CSS animations. Each call re-arms suppression
+// and cancels any pending release, so a burst of renders (STREAM_DONE fires
+// several back-to-back) shares ONE suppression window. The base window is two
+// animation frames + a settle timeout, which covers churn that is NOT a CSS
+// animation (virtual topPad recompute, image-decode, katex measure). But the
+// dominant churn is CSS max-height collapse/expand animations on worklog rows —
+// .activity-body (.34s), .tool-group-body (.3s), .tool-card-detail (.26s) — which
+// run LONGER than a fixed window; a fixed window lifts mid-animation and the rest
+// of the animation still jumps. So we also bind transitionrun/transitionend on
+// #messages: an animation start holds suppression (cancels the pending release);
+// an animation end schedules a short settle after the LAST one. Hard-capped so a
+// looping transition can't pin overflow-anchor:none forever. Desktop rests at
+// none (predicate false) → the whole guard is a no-op.
+const _MOBILE_ANCHOR_BASE_SETTLE_MS=400;
+const _MOBILE_ANCHOR_POST_TRANSITION_MS=90;
+const _MOBILE_ANCHOR_MAX_HOLD_MS=1200;
+let _mobileAnchorSuppressReleaseTimer=null;
+let _mobileAnchorSuppressRafId=0;
+let _mobileAnchorTransitionListenerBound=false;
+let _mobileAnchorSuppressArmedAt=0;
+// Independent hard-cap timer. Unlike the settle/rAF release (which the
+// transitionrun handler CANCELS to hold across an animation), this one is NEVER
+// cancelled by re-arm or by onRun — it is only ever cleared when suppression is
+// actually lifted, and re-armed to a fresh deadline on each _fixMobileScrollJank
+// call. This guarantees overflow-anchor returns to the mobile resting 'auto'
+// even if EVERY transitionend/transitioncancel is missed (animation interrupted,
+// element detached mid-transition, etc.) — the #5338 contract that mobile rests
+// at 'auto' must hold no matter what. (Gate-cert defect: the previous
+// _MOBILE_ANCHOR_MAX_HOLD_MS was only a guard clause inside onRun, so a missed
+// transitionend pinned 'none' forever.)
+let _mobileAnchorMaxHoldTimer=null;
+function _liftMobileAnchorSuppression(el){
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); _mobileAnchorMaxHoldTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Only clear the inline value we set; a concurrent path may have legitimately
+  // re-armed it (checked via the 'none' guard).
+  if(el&&el.style&&el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+}
+function _bindMobileAnchorTransitionExtender(el){
+  if(_mobileAnchorTransitionListenerBound||!el||!el.addEventListener) return;
+  _mobileAnchorTransitionListenerBound=true;
+  // Only act while suppression is actually armed (inline 'none') and within the
+  // hard cap, so we never pin overflow-anchor:none indefinitely.
+  const onRun=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    if(_mobileAnchorSuppressArmedAt && (performance.now()-_mobileAnchorSuppressArmedAt)>_MOBILE_ANCHOR_MAX_HOLD_MS) return;
+    // An animation is running — cancel the pending SETTLE release so we stay
+    // suppressed until it ends (transitionend re-schedules the settle). The
+    // independent max-hold timer is deliberately NOT cancelled here.
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+    if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+    _mobileAnchorSuppressRafId=0;
+  };
+  const onEnd=(e)=>{
+    if(!e||e.propertyName!=='max-height') return;
+    if(el.style.overflowAnchor!=='none') return;
+    // This animation ended; settle shortly after (another may still be running,
+    // in which case its own transitionrun already cancelled this timer).
+    if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); }
+    _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+      _mobileAnchorSuppressReleaseTimer=null;
+      _liftMobileAnchorSuppression(el);
+    },_MOBILE_ANCHOR_POST_TRANSITION_MS);
+  };
+  el.addEventListener('transitionrun',onRun,{passive:true});
+  el.addEventListener('transitionstart',onRun,{passive:true});
+  el.addEventListener('transitionend',onEnd,{passive:true});
+  el.addEventListener('transitioncancel',onEnd,{passive:true});
+}
 window._fixMobileScrollJank=function _fixMobileScrollJank(){
   const el=document.getElementById('messages');
   if(!el) return;
-  // Route through the same "is the browser scroll-anchor layer active?" predicate
-  // as _suppressBrowserOverflowAnchor so the two guards can't drift (#5338 review).
-  // Desktop rests at overflow-anchor:none (predicate false) → nothing to suppress.
-  // Mobile touch devices rest at auto (predicate true) → temporarily suppress
-  // anchor re-selection during the wipe-and-rebuild gap.
-  if(!_browserOverflowAnchorActive(el)) return;
+  // Engage when the browser scroll-anchor layer is active (mobile auto), OR when
+  // WE are already holding an inline suppression from a prior call in the same
+  // burst. The predicate reads the COMPUTED value, which our own inline
+  // overflow-anchor:none flips to 'none' — so on the 2nd..Nth call of a
+  // STREAM_DONE burst the predicate would say false and short-circuit the re-arm
+  // below, collapsing the whole "consecutive renders extend the window" behavior
+  // to a single first-call window. Treat an inline 'none' WE set as still-armed
+  // so re-arm actually runs. Desktop rests at computed 'none' with EMPTY inline,
+  // so `alreadySuppressed` is false there and this stays a no-op. (Gate-cert
+  // defect: re-arm was dead code without this.)
+  const alreadySuppressed=el.style.overflowAnchor==='none';
+  if(!alreadySuppressed && !_browserOverflowAnchorActive(el)) return;
   el.style.overflowAnchor='none';
-  requestAnimationFrame(()=>{
-    if(el.style.overflowAnchor==='none') el.style.overflowAnchor='';
+  _bindMobileAnchorTransitionExtender(el);
+  _mobileAnchorSuppressArmedAt=performance.now();
+  // Re-arm: cancel any pending release so consecutive renders EXTEND, not shorten,
+  // the suppression window (the STREAM_DONE settle fires renderMessages several
+  // times back-to-back, plus a deferred postProcess reflow).
+  if(_mobileAnchorSuppressReleaseTimer){ clearTimeout(_mobileAnchorSuppressReleaseTimer); _mobileAnchorSuppressReleaseTimer=null; }
+  if(_mobileAnchorSuppressRafId&&typeof cancelAnimationFrame==='function'){ cancelAnimationFrame(_mobileAnchorSuppressRafId); }
+  _mobileAnchorSuppressRafId=0;
+  // Independent hard cap: (re)arm a release that NOTHING cancels except an actual
+  // lift, so a missed transitionend can never pin 'none' past the cap.
+  if(_mobileAnchorMaxHoldTimer){ clearTimeout(_mobileAnchorMaxHoldTimer); }
+  _mobileAnchorMaxHoldTimer=setTimeout(()=>{
+    _mobileAnchorMaxHoldTimer=null;
+    _liftMobileAnchorSuppression(el);
+  },_MOBILE_ANCHOR_MAX_HOLD_MS);
+  const rafHop=(cb)=>{ if(typeof requestAnimationFrame==='function') return requestAnimationFrame(cb); return setTimeout(cb,16); };
+  // Base window: two animation frames (paint + post-render reflow settle) THEN a
+  // settle timeout. CSS max-height animations are covered by the transitionrun/
+  // transitionend extender above; this floor covers non-animated churn.
+  _mobileAnchorSuppressRafId=rafHop(()=>{
+    _mobileAnchorSuppressRafId=rafHop(()=>{
+      _mobileAnchorSuppressReleaseTimer=setTimeout(()=>{
+        _mobileAnchorSuppressReleaseTimer=null;
+        _liftMobileAnchorSuppression(el);
+      },_MOBILE_ANCHOR_BASE_SETTLE_MS);
+    });
   });
 };
 

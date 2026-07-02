@@ -26,12 +26,14 @@ import sys
 import threading
 import time
 import uuid
+import http.client
+import socket as _socket
 from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -454,10 +456,12 @@ def _visible_pinned_lineage_ids(session_rows) -> set[str]:
 from api.profiles import (  # noqa: F401, E402  (re-export)
     _profiles_match,
     _is_isolated_profile_mode,
+    _is_root_profile,
     _SKILLS_STATS_CACHE,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
+    list_profiles_api,
 )
 
 
@@ -12021,7 +12025,8 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/sessions":
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
         try:
-            from api.profiles import get_active_profile_name
+            from api import profiles as profiles_api
+
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
@@ -12032,7 +12037,7 @@ def handle_get(handler, parsed) -> bool:
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
             show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
-            active_profile = get_active_profile_name()
+            active_profile = profiles_api.get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
             include_archived = _query_flag(parsed, "include_archived")
             exclude_hidden = _query_flag(parsed, "exclude_hidden")
@@ -12093,8 +12098,9 @@ def handle_get(handler, parsed) -> bool:
         # ── Profile scoping (#1614) ────────────────────────────────────────
         # Default: filter to the active profile. ?all_profiles=1 returns the
         # aggregate list so settings/admin UIs can still see everything.
-        from api.profiles import get_active_profile_name
-        active_profile = get_active_profile_name()
+        from api import profiles as profiles_api
+
+        active_profile = profiles_api.get_active_profile_name()
         all_projects = load_projects()
         isolated_profile_mode = _is_isolated_profile_mode()
         all_profiles = _all_profiles_enabled(parsed)
@@ -12515,28 +12521,21 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
-        from api.profiles import (
-            get_active_profile_name,
-            list_profiles_api,
-        )
+        from api import profiles as profiles_api
 
         return j(
             handler,
             {
-                "profiles": list_profiles_api(),
-                "active": get_active_profile_name(),
+                "profiles": profiles_api.list_profiles_api(),
+                "active": profiles_api.get_active_profile_name(),
                 "single_profile_mode": _is_isolated_profile_mode(),
             },
         )
 
     if parsed.path == "/api/profile/active":
-        from api.profiles import (
-            _is_root_profile,
-            get_active_hermes_home,
-            get_active_profile_name,
-        )
+        from api import profiles as profiles_api
 
-        active_profile_name = get_active_profile_name()
+        active_profile_name = profiles_api.get_active_profile_name()
         # Resolve the ACTIVE PROFILE's configured workspace so a cold boot with a
         # profile cookie shows the right composer workspace chip on a blank
         # new-chat page (#5169). Use get_profile_default_workspace() (NOT
@@ -12554,8 +12553,8 @@ def handle_get(handler, parsed) -> bool:
             handler,
             {
                 "name": active_profile_name,
-                "path": str(get_active_hermes_home()),
-                "is_default": _is_root_profile(active_profile_name),
+                "path": str(profiles_api.get_active_hermes_home()),
+                "is_default": profiles_api._is_root_profile(active_profile_name),
                 "default_workspace": _profile_default_workspace,
             },
         )
@@ -13024,19 +13023,29 @@ def handle_post(handler, parsed) -> bool:
         # ── Memory lifecycle: commit the previous session before starting a new one ──
         prev_session_id = body.get("prev_session_id")
         if prev_session_id:
-            if not _session_id_visible_to_request_profile(handler, prev_session_id):
-                return True
-            try:
-                from api.session_lifecycle import commit_session_memory
-                from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
-                prev_agent = None
-                with SESSION_AGENT_CACHE_LOCK:
-                    _cached = SESSION_AGENT_CACHE.get(prev_session_id)
-                    if _cached:
-                        prev_agent = _cached[0]
-                commit_session_memory(prev_session_id, agent=prev_agent)
-            except Exception:
-                logger.debug("Lifecycle commit for prev_session %s failed", prev_session_id, exc_info=True)
+            if not _session_id_visible_to_request_profile(
+                handler, prev_session_id, emit_error=False
+            ):
+                # Cross-profile hand-off after a profile switch: skip memory
+                # commit for the previous profile's session, but still create
+                # the new session (#5420).
+                prev_session_id = None
+            if prev_session_id:
+                try:
+                    from api.session_lifecycle import commit_session_memory
+                    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
+                    prev_agent = None
+                    with SESSION_AGENT_CACHE_LOCK:
+                        _cached = SESSION_AGENT_CACHE.get(prev_session_id)
+                        if _cached:
+                            prev_agent = _cached[0]
+                    commit_session_memory(prev_session_id, agent=prev_agent)
+                except Exception:
+                    logger.debug(
+                        "Lifecycle commit for prev_session %s failed",
+                        prev_session_id,
+                        exc_info=True,
+                    )
         s = new_session(
             workspace=workspace,
             model=model,
@@ -14610,7 +14619,6 @@ def handle_post(handler, parsed) -> bool:
         # #1614: refuse moves into a project owned by another profile.
         target_pid = body.get("project_id") or None
         if target_pid:
-            from api.profiles import get_active_profile_name
             # Use the session's own profile for authorization, not the global
             # active profile. A session belongs to a specific profile set at
             # creation; projects from that profile should always be assignable,
@@ -14660,7 +14668,6 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         import re as _re
-        from api.profiles import get_active_profile_name
 
         name = body["name"].strip()[:128]
         if not name:
@@ -14695,7 +14702,6 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         import re as _re
-        from api.profiles import get_active_profile_name
 
         projects = load_projects()
         proj = next(
@@ -14721,7 +14727,6 @@ def handle_post(handler, parsed) -> bool:
             require(body, "project_id")
         except ValueError as e:
             return bad(handler, str(e))
-        from api.profiles import get_active_profile_name
         projects = load_projects()
         proj = next(
             (p for p in projects if p["project_id"] == body["project_id"]), None
@@ -16302,6 +16307,34 @@ _TTS_PROXY_MAX_BYTES = 16 * 1024 * 1024
 _TTS_LOCALHOST_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+def _tts_addr_is_blocked(ip_str: str) -> bool:
+    """Return True when IP is in a private or otherwise non-routable class.
+
+    The explicit flags below document the concrete SSRF-risk classes, but the
+    load-bearing rule is the ``not is_global`` backstop: it blocks every address
+    that is not globally routable — including ranges the named flags miss, most
+    notably ``100.64.0.0/10`` (RFC 6598 CGNAT, also Tailscale's default address
+    space), the ``198.18.0.0/15`` benchmarking range, and any future
+    non-global allocation — so a rebinding host cannot reach a victim's tailnet
+    or carrier-NAT peer.
+    """
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def _tts_host_is_blocked_target(hostname: str) -> bool:
     """True if the hostname resolves to (or literally is) a private / loopback /
     link-local / reserved / multicast address — the SSRF-risk targets that an
@@ -16315,24 +16348,10 @@ def _tts_host_is_blocked_target(hostname: str) -> bool:
     if not host:
         return True
 
-    def _addr_blocked(ip_str: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return False
-        return (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        )
-
     # Literal IP host?
     try:
         ipaddress.ip_address(host)
-        return _addr_blocked(host)
+        return _tts_addr_is_blocked(host)
     except ValueError:
         pass
 
@@ -16349,9 +16368,40 @@ def _tts_host_is_blocked_target(hostname: str) -> bool:
         return False
     for info in infos:
         sockaddr = info[4]
-        if sockaddr and _addr_blocked(str(sockaddr[0])):
+        if sockaddr and _tts_addr_is_blocked(str(sockaddr[0])):
             return True
     return False
+
+
+def _tts_resolve_pinned_addresses(hostname: str, port: int | None) -> list[str]:
+    """Resolve once, validate the RRset, and preserve candidate dial order."""
+    import socket
+
+    host = (hostname or "").strip().lower()
+    if not host:
+        raise ValueError("invalid OpenAI TTS base_url host")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as exc:
+        raise ValueError("could not resolve OpenAI TTS base_url host") from exc
+    pinned_hosts = []
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        pinned_host = str(sockaddr[0])
+        if _tts_addr_is_blocked(pinned_host):
+            raise ValueError("resolved OpenAI TTS target is not allowed")
+        pinned_hosts.append(pinned_host)
+    if not pinned_hosts:
+        raise ValueError("could not resolve OpenAI TTS base_url host")
+    return pinned_hosts
+
+
+def _tts_resolve_pinned_address(hostname: str) -> str:
+    """Return the first vetted literal address for direct helper callers."""
+    return _tts_resolve_pinned_addresses(hostname, None)[0]
 
 
 def _normalized_openai_tts_base_url(base_url: str) -> str:
@@ -16412,6 +16462,52 @@ def _buffer_tts_audio_response(resp, *, max_bytes: int | None = None) -> bytes:
         if len(audio_data) > max_bytes:
             raise ValueError("upstream audio exceeded byte limit")
     return bytes(audio_data)
+
+class _NoRedirectTtsHandler(HTTPRedirectHandler):
+    """Refuse to follow redirects on the TTS call.
+
+    A redirect is never a legitimate response to POST /audio/speech and can
+    carry the Authorization bearer to a target that bypasses the base_url check.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("OpenAI TTS upstream attempted a redirect")
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a pinned IP while keeping Host and TLS SNI on the hostname."""
+
+    def connect(self):
+        sys.audit("http.client.connect", self, self.host, self.port)
+        last_error = None
+        for pinned_host in _tts_resolve_pinned_addresses(self.host, self.port):
+            try:
+                self.sock = _socket.create_connection(
+                    (pinned_host, self.port), self.timeout, self.source_address
+                )
+                break
+            except OSError as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+            raise OSError("could not connect to any pinned OpenAI TTS target")
+        try:
+            self.sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            if exc.errno != errno.ENOPROTOOPT:
+                raise
+
+        if self._tunnel_host:
+            self._tunnel()
+
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
 def _tts_open(req, *, timeout=30, opener_factory=None):
@@ -16664,29 +16760,18 @@ def _handle_tts(handler, parsed):
             "voice": oai_voice,
         }).encode("utf-8")
 
-        from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen as _urlopen
-
-        class _NoRedirectTtsHandler(HTTPRedirectHandler):
-            """Refuse to follow redirects on the TTS call. A redirect is never a
-            legitimate response to a POST /audio/speech, and following one would
-            (a) carry the Authorization bearer to the redirect target and
-            (b) let a public host bounce the request to a private/link-local
-            SSRF target after the base-url validation already passed."""
-
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                raise ValueError("OpenAI TTS upstream attempted a redirect")
-
+        from urllib.request import Request, build_opener, urlopen as _urlopen
         req = Request(url, data=req_body, headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "audio/mpeg",
         })
 
-        # Use a no-redirect opener so an upstream redirect can't carry the bearer
-        # to (or SSRF-bounce into) a different/private target. _tts_open is a thin
-        # module seam so tests can still intercept the network call.
+        # Use a pinned HTTPS opener so the resolved address is the one that gets
+        # dialed. Keep the no-redirect handler in the same chain to block
+        # bearer leaks and SSRF bounce redirects after hostname validation.
         try:
-            with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(_NoRedirectTtsHandler())) as resp:
+            with _tts_open(req, timeout=30, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler(), _PinnedHTTPSHandler())) as resp:
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
             logger.warning("OpenAI TTS rejected an invalid upstream response", exc_info=True)
