@@ -14,10 +14,21 @@
 // cancelStream: stop the active chat stream.
 // See docs/rfcs/webui-run-state-consistency-contract.md (Invariants #2, #4)
 // for the owner-aware + terminal-settle rationale.
-async function cancelStream(){
+async function cancelStream(reason){
   const sid = S.session && S.session.session_id;
   const streamId = S.activeStreamId;
   if(!streamId) return;
+  // Interrupt provenance: log WHY the active run is being cancelled so operators
+  // can tell an explicit Stop / interrupt from any other trigger when they see a
+  // SIGINT/exit-code-130 in the backend logs. Only explicit user paths reach
+  // this function (Stop button, /stop, /interrupt, busy-interrupt); passive
+  // lifecycle events — session switch, tab hide, page unload — tear down the
+  // LOCAL SSE transport via closeLiveStream() and never call /api/chat/cancel,
+  // so they never interrupt the backend agent/tool run. (#5345)
+  const _reason = reason || 'explicit-cancel';
+  if(typeof console !== 'undefined' && console.info){
+    console.info('[stream] cancel requested', {reason:_reason, streamId, sessionId:sid});
+  }
   let respBody=null;
   try{
     const r=await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
@@ -54,6 +65,11 @@ async function cancelSessionStream(session){
   const streamId = session&&session.active_stream_id;
   const sid = session&&session.session_id;
   if(!streamId||!sid) return;
+  // Explicit sidebar "Stop response" — log provenance for the same reason as
+  // cancelStream(). (#5345)
+  if(typeof console !== 'undefined' && console.info){
+    console.info('[stream] cancel requested', {reason:'sidebar-stop', streamId, sessionId:sid});
+  }
   try{
     await fetch(new URL(`api/chat/cancel?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{credentials:'include'});
   }catch(e){/* close local stream; keep UI state honest below */}
@@ -656,6 +672,11 @@ function _micToastKeyForRecognitionError(error){
   let _finalText='';
   let _prefix='';
   let _isRecording=false;
+  let _micHoldTimer=null;
+  let _micHoldActive=false;
+  let _micPointerDown=false;
+  let _micStartSeq=0;
+  const _micHoldThresholdMs=300;
 
   function _setButtonTooltipAndKey(btn, key){
     const text = t(key);
@@ -762,14 +783,16 @@ function _micToastKeyForRecognitionError(error){
     }
   }
 
-  function _stopTracks(){
-    if(mediaStream){
-      mediaStream.getTracks().forEach(track=>track.stop());
-      mediaStream=null;
+  function _stopTracks(stream=mediaStream){
+    if(stream){
+      stream.getTracks().forEach(track=>track.stop());
+      if(mediaStream===stream) mediaStream=null;
     }
   }
 
   function _stopMic(){
+    _micStartSeq+=1;
+    _isRecording=false;
     if(!window._micActive) return;
     // Stop the backend that was ACTIVE WHEN RECORDING STARTED — not whatever
     // _rawAudioMode says now. The user can toggle Settings → Sound mid-recording,
@@ -879,7 +902,31 @@ function _micToastKeyForRecognitionError(error){
 
   _probeServerSttCapability();
 
-  btn.onclick=async()=>{
+  function _clearMicHoldTimer(){
+    if(_micHoldTimer){
+      clearTimeout(_micHoldTimer);
+      _micHoldTimer=null;
+    }
+  }
+
+  function _resetMicHoldState(){
+    _clearMicHoldTimer();
+    _micHoldActive=false;
+    _micPointerDown=false;
+  }
+
+  function _micButtonAvailable(){
+    if(!btn||btn.disabled) return false;
+    if(btn.style.display==='none') return false;
+    if(btn.classList.contains('composer-control-hidden')) return false;
+    if(btn.getAttribute('aria-hidden')==='true') return false;
+    if(window.getComputedStyle&&window.getComputedStyle(btn).display==='none') return false;
+    return true;
+  }
+
+  async function _startMicCapture(holdRequired=false){
+    if(!_micButtonAvailable()) return;
+    const startSeq=++_micStartSeq;
     // Race-condition guard: ignore rapid double-clicks
     if(_isRecording){
       _stopMic();
@@ -911,26 +958,38 @@ function _micToastKeyForRecognitionError(error){
       return;
     }
     try{
-      mediaStream=await navigator.mediaDevices.getUserMedia({audio:true});
+      const captureStream=await navigator.mediaDevices.getUserMedia({audio:true});
+      if(startSeq!==_micStartSeq||!_micButtonAvailable()||(holdRequired&&!_micHoldActive)){
+        _isRecording=false;
+        _stopTracks(captureStream);
+        return;
+      }
+      mediaStream=captureStream;
       const preferredTypes=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/ogg'];
       const mimeType=preferredTypes.find(type=>window.MediaRecorder.isTypeSupported?.(type))||'';
-      mediaRecorder=new MediaRecorder(mediaStream,mimeType?{mimeType}:undefined);
+      const captureMode=_rawAudioMode?'media-raw':'media-transcribe';
+      const recorder=new MediaRecorder(captureStream,mimeType?{mimeType}:undefined);
       audioChunks=[];
-      mediaRecorder.ondataavailable=e=>{if(e.data&&e.data.size)audioChunks.push(e.data);};
-      mediaRecorder.onerror=()=>{
+      const captureChunks=audioChunks;
+      recorder.ondataavailable=e=>{if(e.data&&e.data.size)captureChunks.push(e.data);};
+      recorder.onerror=()=>{
+        const isCurrentCapture=mediaRecorder===recorder||mediaStream===captureStream;
         _isRecording=false;
-        _setRecording(false);
+        if(mediaRecorder===recorder) mediaRecorder=null;
+        if(isCurrentCapture) _setRecording(false);
         window._micPendingSend=false;
-        _stopTracks();
+        _stopTracks(captureStream);
         showToast(t('mic_network'));
       };
-      mediaRecorder.onstop=async()=>{
+      recorder.onstop=async()=>{
+        const isCurrentCapture=mediaRecorder===recorder||mediaStream===captureStream;
+        if(mediaRecorder===recorder) mediaRecorder=null;
         _isRecording=false;
-        const blob=new Blob(audioChunks,{type:mediaRecorder.mimeType||mimeType||'audio/webm'});
-        _setRecording(false);
-        _stopTracks();
+        const blob=new Blob(captureChunks,{type:recorder.mimeType||mimeType||'audio/webm'});
+        if(isCurrentCapture) _setRecording(false);
+        _stopTracks(captureStream);
         if(blob.size){
-          if(_activeCaptureMode==='media-raw'){
+          if(captureMode==='media-raw'){
             await _sendRawAudio(blob);
           }else{
             await _transcribeBlob(blob);
@@ -941,16 +1000,81 @@ function _micToastKeyForRecognitionError(error){
         }
         _applyDeferredServerSttFlip();
       };
-      _activeCaptureMode=_rawAudioMode?'media-raw':'media-transcribe';
-      mediaRecorder.start();
+      _activeCaptureMode=captureMode;
+      mediaRecorder=recorder;
+      recorder.start();
       _setRecording(true);
     }catch(err){
+      if(startSeq!==_micStartSeq) return;
       _isRecording=false;
       window._micPendingSend=false;
       _stopTracks();
       showToast(t(_micToastKeyForRecognitionError('not-allowed')||'mic_denied'));
     }
-  };
+  }
+
+  async function _toggleMicCapture(){
+    if(!_micButtonAvailable()) return;
+    if(window._micActive){
+      _stopMic();
+      return;
+    }
+    await _startMicCapture();
+  }
+  window._toggleMicCapture=_toggleMicCapture;
+
+  btn.addEventListener('pointerdown',e=>{
+    if(e.button!==0) return;
+    if(!_micButtonAvailable()) return;
+    _resetMicHoldState();
+    _micPointerDown=true;
+    _micHoldTimer=setTimeout(async()=>{
+      _micHoldTimer=null;
+      if(!_micPointerDown||window._micActive) return;
+      _micHoldActive=true;
+      await _startMicCapture(true);
+    },_micHoldThresholdMs);
+  });
+
+  btn.addEventListener('pointerup',async e=>{
+    if(e.button!==0||!_micPointerDown) return;
+    _clearMicHoldTimer();
+    if(_micHoldActive){
+      _micHoldActive=false;
+      _micPointerDown=false;
+      _stopMic();
+      return;
+    }
+    _micPointerDown=false;
+    await _toggleMicCapture();
+  });
+
+  btn.addEventListener('pointerleave',()=>{
+    _clearMicHoldTimer();
+    if(_micHoldActive){
+      _micHoldActive=false;
+      _micPointerDown=false;
+      _stopMic();
+      return;
+    }
+    _micPointerDown=false;
+  });
+
+  btn.addEventListener('pointercancel',()=>{
+    _clearMicHoldTimer();
+    if(_micHoldActive){
+      _micHoldActive=false;
+      _micPointerDown=false;
+      _stopMic();
+      return;
+    }
+    _micPointerDown=false;
+  });
+
+  btn.addEventListener('click',async e=>{
+    if(e.detail!==0) return;
+    await _toggleMicCapture();
+  });
 
   // Wire up the settings checkbox
   const rawAudioCheckbox = document.getElementById('settingsRawAudio');
@@ -2164,7 +2288,8 @@ function _shouldAttachLargePastedText(text){
 }
 function _largeTextPasteFileName(now){
   const d=new Date(now||Date.now());
-  const stamp=d.toISOString().replace(/[:.]/g,'-').replace('T','_').replace('Z','');
+  const p=n=>String(n).padStart(2,'0');
+  const stamp=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}-${String(d.getMilliseconds()).padStart(3,'0')}`;
   const existing=new Set((S.pendingFiles||[]).map(f=>f&&f.name).filter(Boolean));
   let name=`pasted-text-${stamp}.md`;
   for(let i=2;existing.has(name);i++)name=`pasted-text-${stamp}-${i}.md`;
