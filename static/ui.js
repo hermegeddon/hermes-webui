@@ -6402,12 +6402,12 @@ function getComposerPrimaryAction(){
   }
   const explicitAction=_getExplicitBusyCommandAction(msg&&msg.value);
   if(explicitAction) return explicitAction;
-  const busyMode=window._busyInputMode||'queue';
-  if(busyMode==='steer'){
+  const defaultMessageMode=window._defaultMessageMode||'steer';
+  if(defaultMessageMode==='steer'){
     if(S.activeStreamId&&typeof _trySteer==='function') return 'steer';
     return 'queue';
   }
-  if(busyMode==='interrupt'){
+  if(defaultMessageMode==='interrupt'){
     if(S.activeStreamId&&typeof cancelStream==='function') return 'interrupt';
     return 'queue';
   }
@@ -6425,7 +6425,7 @@ function _applyBusyComposerPlaceholder(){
     input.placeholder=idlePlaceholder;
     return;
   }
-  const busyMode=window._busyInputMode||'queue';
+  const busyMode=window._defaultMessageMode||'steer';
   const busyPlaceholderKey=busyMode==='interrupt'
     ? 'composer_placeholder_busy_interrupt'
     : busyMode==='steer'
@@ -8234,9 +8234,28 @@ function _hideUpdateSummaryPanel(){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
-  if(panel) panel.style.display='none';
+  const toolbar=$('updateSummaryToolbar');
+  if(panel){
+    panel.style.display='none';
+    panel.classList.remove('update-summary-expanded');
+  }
+  if(toolbar) toolbar.style.display='none';
+  _syncUpdateSummaryExpandButton(false);
   if(text) text.textContent='';
   if(links){links.replaceChildren();links.style.display='none';}
+}
+function _syncUpdateSummaryExpandButton(expanded){
+  const btn=$('btnUpdateSummaryExpand');
+  if(!btn) return;
+  btn.setAttribute('aria-expanded',expanded?'true':'false');
+  btn.textContent=expanded?'Collapse summary':'Expand summary';
+}
+function toggleUpdateSummaryExpanded(){
+  const panel=$('updateSummaryPanel');
+  if(!panel||panel.style.display==='none') return;
+  const expanded=!panel.classList.contains('update-summary-expanded');
+  panel.classList.toggle('update-summary-expanded',expanded);
+  _syncUpdateSummaryExpandButton(expanded);
 }
 const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';
 function _loadStoredUpdateSummaries(){
@@ -8290,8 +8309,12 @@ function _renderUpdateSummaryPanel(payload,data,targetKey){
   const panel=$('updateSummaryPanel');
   const text=$('updateSummaryText');
   const links=$('updateSummaryDiffLinks');
+  const toolbar=$('updateSummaryToolbar');
   if(!panel||!text) return;
   panel.style.display='block';
+  panel.classList.remove('update-summary-expanded');
+  _syncUpdateSummaryExpandButton(false);
+  if(toolbar) toolbar.style.display='flex';
   const sections=Array.isArray(payload&&payload.summary_sections)?payload.summary_sections:null;
   text.replaceChildren();
   if(sections&&sections.length){
@@ -12566,7 +12589,24 @@ function renderMessages(options){
   if(sid&&INFLIGHT[sid]){
     const _lt=document.getElementById('liveAssistantTurn');
     if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      _preservedLiveTurn=_lt;
+      // Blank-turn fix (对话消失): only preserve the live turn across the DOM
+      // wipe if it is GENUINELY live — either an active stream is still running
+      // (S.activeStreamId set: the #3877 mid-stream flicker case this preserve
+      // was written for), or the turn already holds real rendered content (a
+      // visible answer body, a tool card, or a reasoning row). A DEAD shell —
+      // an interrupted turn whose stream dropped (S.activeStreamId cleared to
+      // null) but whose INFLIGHT[sid] entry was not cleaned, leaving only an
+      // empty worklog group ("Processed Ns" with no body/tool rows) — must NOT
+      // be preserved: re-attaching it on a session-updated swap re-render pins
+      // an avatar-only empty turn OVER the settled transcript, hiding the real
+      // (already-persisted) answer. That is the reported blank. Reproduced +
+      // fix verified on an isolated debug instance (8710): stale INFLIGHT +
+      // empty live-turn survived the swap → blank; gating on real-content /
+      // active-stream clears it while a genuine live turn still renders.
+      const _hasRealLiveContent=!!_lt.querySelector('.msg-body, .tool-card-row, .wl-reason');
+      if(_hasRealLiveContent || S.activeStreamId){
+        _preservedLiveTurn=_lt;
+      }
     }
   }
   const compressionState=(()=>{

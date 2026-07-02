@@ -7915,6 +7915,8 @@ function _preferencesPayloadFromUi(){
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
   if(showCliCb) payload.show_cli_sessions=showCliCb.checked;
+  const showClaudeCodeCb=$('settingsShowClaudeCodeSessions');
+  if(showClaudeCodeCb) payload.show_claude_code_sessions=showClaudeCodeCb.checked;
   const showCronCb=$('settingsShowCronSessions');
   // Gate cron sessions on CLI sessions (the server short-circuits otherwise),
   // identically to the explicit saveSettings() path, so neither save route can
@@ -7944,8 +7946,8 @@ function _preferencesPayloadFromUi(){
   if(pinnedLimitField) payload.pinned_sessions_limit=parseInt(pinnedLimitField.value,10);
   const autoTitleRefreshSel=$('settingsAutoTitleRefresh');
   if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
-  const busyInputModeSel=$('settingsBusyInputMode');
-  if(busyInputModeSel) payload.busy_input_mode=busyInputModeSel.value;
+  const defaultMessageModeSel=$('settingsDefaultMessageMode');
+  if(defaultMessageModeSel) payload.default_message_mode=defaultMessageModeSel.value;
   const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
   if(showBusyPlaceholderHintCb) payload.show_busy_placeholder_hint=showBusyPlaceholderHintCb.checked;
   const botNameField=$('settingsBotName');
@@ -8021,8 +8023,11 @@ async function _autosavePreferencesSettings(payload){
       document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';
       if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
     }
-    if(payload&&payload.busy_input_mode!==undefined){
-      window._busyInputMode=(typeof _persistBusyInputMode==='function')?_persistBusyInputMode(saved&&saved.busy_input_mode):((saved&&saved.busy_input_mode)||'queue');
+    if(payload&&payload.default_message_mode!==undefined){
+      // #5170 mirror write on autosave, under the #5145 rename: persist the
+      // saved mode so a reload/offline first-send honors it (legacy fallback).
+      const _dmm=(saved&&saved.default_message_mode)||(saved&&saved.busy_input_mode);
+      window._defaultMessageMode=(typeof _persistDefaultMessageMode==='function')?_persistDefaultMessageMode(_dmm):(_dmm||'steer');
       if(typeof _applyBusyComposerPlaceholder==='function') _applyBusyComposerPlaceholder();
     }
     if(payload&&payload.show_busy_placeholder_hint!==undefined){
@@ -8447,12 +8452,23 @@ async function loadSettingsPanel(){
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
     if(showCliCb){showCliCb.checked=settings.show_cli_sessions!==false;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const showClaudeCodeCb=$('settingsShowClaudeCodeSessions');
+    if(showClaudeCodeCb){
+      showClaudeCodeCb.checked=!!settings.show_claude_code_sessions;
+      showClaudeCodeCb.disabled=showCliCb?!showCliCb.checked:true;
+      showClaudeCodeCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+    }
+    if(showCliCb){showCliCb.addEventListener('change',function(){
+      const enabled=!!showCliCb.checked;
+      if(showCronCb) showCronCb.disabled=!enabled;
+      if(showClaudeCodeCb) showClaudeCodeCb.disabled=!enabled;
+      _schedulePreferencesAutosave();
+    },{once:false});}
     const showCronCb=$('settingsShowCronSessions');
     if(showCronCb){
       showCronCb.checked=!!settings.show_cron_sessions;
       showCronCb.disabled=showCliCb?!showCliCb.checked:true;
       showCronCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-      if(showCliCb){showCliCb.addEventListener('change',function(){showCronCb.disabled=!showCliCb.checked;},{once:false});}
     }
     const showWebhookCb=$('settingsShowWebhookSessions');
     if(showWebhookCb){
@@ -8607,13 +8623,14 @@ async function loadSettingsPanel(){
       autoTitleRefreshSel.value=['0','5','10','20'].includes(val)?val:'0';
       autoTitleRefreshSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
-    // Busy input mode
-    const busyInputModeSel=$('settingsBusyInputMode');
-    if(busyInputModeSel){
-      const val=String(settings.busy_input_mode||'queue');
-      busyInputModeSel.value=['queue','interrupt','steer'].includes(val)?val:'queue';
-      window._busyInputMode=(typeof _persistBusyInputMode==='function')?_persistBusyInputMode(busyInputModeSel.value):busyInputModeSel.value;
-      busyInputModeSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+    // Default message mode
+    const defaultMessageModeSel=$('settingsDefaultMessageMode');
+    if(defaultMessageModeSel){
+      const val=String(settings.default_message_mode||settings.busy_input_mode||'steer');
+      defaultMessageModeSel.value=['queue','interrupt','steer'].includes(val)?val:'steer';
+      // #5170 mirror write on panel load, under the #5145 rename.
+      window._defaultMessageMode=(typeof _persistDefaultMessageMode==='function')?_persistDefaultMessageMode(defaultMessageModeSel.value):defaultMessageModeSel.value;
+      defaultMessageModeSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     const showBusyPlaceholderHintCb=$('settingsShowBusyPlaceholderHint');
     if(showBusyPlaceholderHintCb){
@@ -10693,9 +10710,11 @@ function _applySavedSettingsUi(saved, body, opts){
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
-  window._busyInputMode=(typeof _persistBusyInputMode==='function')
-    ? _persistBusyInputMode(body.busy_input_mode)
-    : (body.busy_input_mode||'queue');
+  // #5170 mirror write in _applySavedSettingsUi, under the #5145 rename:
+  // persist so a reload/offline first-send honors the resolved mode.
+  window._defaultMessageMode=(typeof _persistDefaultMessageMode==='function')
+    ? _persistDefaultMessageMode(body.default_message_mode||body.busy_input_mode)
+    : (body.default_message_mode||body.busy_input_mode||'steer');
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._autoScrollFollow=body.auto_scroll_follow!==false;
   window._largeTextPasteAsAttachment=body.large_text_paste_as_attachment!==false;
@@ -11257,6 +11276,7 @@ async function saveSettings(andClose){
   const showTps=!!($('settingsShowTps')||{}).checked;
   const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
+  const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
@@ -11267,7 +11287,7 @@ async function saveSettings(andClose){
   const fontSize=($('settingsFontSize')||{}).value||localStorage.getItem('hermes-font-size')||'default';
   const language=($('settingsLanguage')||{}).value||'en';
   const sidebarDensity=($('settingsSidebarDensity')||{}).value==='detailed'?'detailed':'compact';
-  const busyInputMode=($('settingsBusyInputMode')||{}).value||'queue';
+  const defaultMessageMode=($('settingsDefaultMessageMode')||{}).value||'steer';
   const showBusyPlaceholderHint=!!($('settingsShowBusyPlaceholderHint')||{}).checked;
   const body={};
 
@@ -11304,6 +11324,8 @@ async function saveSettings(andClose){
   body.workspace_todos_tab=!!window._workspaceTodosTab;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
+  // Persist the opt-out child independently; the read path applies the parent gate.
+  body.show_claude_code_sessions=showClaudeCodeSessions;
   // Cron and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
@@ -11319,7 +11341,7 @@ async function saveSettings(andClose){
   body.notifications_enabled=!!($('settingsNotificationsEnabled')||{}).checked;
   body.show_thinking=window._showThinking!==false;
   body.sidebar_density=sidebarDensity;
-  body.busy_input_mode=busyInputMode;
+  body.default_message_mode=defaultMessageMode;
   body.auto_title_refresh_every=(($('settingsAutoTitleRefresh')||{}).value||'0');
   const botName=(($('settingsBotName')||{}).value||'').trim();
   body.bot_name=botName||'Hermes';
