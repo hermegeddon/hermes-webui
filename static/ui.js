@@ -868,13 +868,27 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const container=$('messages');
   if(!container||!anchor) return false;
   const anchorKey=String(anchor.key||'');
-  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
-  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
-  if(!row&&anchorKey) return false;
   const sessionIdx=Number(anchor.sessionIdx);
   const hasSessionIdx=Number.isFinite(sessionIdx);
+  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
+  // The anchor key is content-derived (role|ts|attachments|first-160-chars, built by
+  // _messageViewportAnchorKeyForMessage) so it goes STALE while a live assistant
+  // message is still streaming: every chunk that changes the first 160 chars
+  // recomputes that row's data-message-anchor-key, so a snapshot captured mid-stream
+  // no longer matches by key. We used to concede the moment the keyed lookup missed
+  // (`if(!row&&anchorKey) return false`), and the caller then fell back to an ABSOLUTE
+  // scrollTop=snapshot.top that does NOT compensate the above-viewport height growth
+  // from that same streaming chunk — the residual DESKTOP scroll jump-back. (Desktop
+  // rests at overflow-anchor:none, so #5392's mobile overflow-anchor guard is a no-op
+  // here; this is a distinct code path.) The anchored row is still in the DOM under
+  // its STABLE session-relative index, so recover it via sessionIdx before conceding.
+  // A genuinely removed anchor (message compressed/deleted away) misses key AND
+  // sessionIdx and still returns false. A missing sessionIdx is NOT degraded to the
+  // window-relative rawIdx (which could resolve to a different message), preserving
+  // the original per-tier guard.
   if(!row&&hasSessionIdx) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
-  if(!row&&hasSessionIdx) return false;
+  if(!row&&(anchorKey||hasSessionIdx)) return false;
   const targetIdx=Number(anchor.rawIdx)+Number(rawIdxDelta||0);
   if(!row&&Number.isFinite(targetIdx)) row=container.querySelector(`[data-msg-idx="${targetIdx}"]`);
   if(!row) return false;
@@ -1504,9 +1518,19 @@ function _mountMermaidViewer(svgEl, options = {}) {
   };
   root._mermaidViewer = state;
 
+  function _lightboxViewportEnvelope() {
+    const width = Math.round((window.innerWidth || box.width) * 0.9);
+    const height = Math.round((window.innerHeight || box.height) * 0.9);
+    return {
+      width: Math.max(1, Number.isFinite(width) ? width : 1),
+      height: Math.max(1, Number.isFinite(height) ? height : 1),
+    };
+  }
+
   function _viewportFallbackSize(){
-    const width = mode === 'lightbox' ? Math.round((window.innerWidth || box.width) * 0.9) : Math.round(window.innerWidth || box.width);
-    const height = mode === 'lightbox' ? Math.round((window.innerHeight || box.height) * 0.9) : Math.round((window.innerHeight || box.height) * 0.7);
+    if(mode === 'lightbox') return _lightboxViewportEnvelope();
+    const width = Math.round(window.innerWidth || box.width);
+    const height = Math.round((window.innerHeight || box.height) * 0.7);
     return {
       width: Math.max(1, Number.isFinite(width) ? width : 1),
       height: Math.max(1, Number.isFinite(height) ? height : 1),
@@ -1516,8 +1540,12 @@ function _mountMermaidViewer(svgEl, options = {}) {
   function _viewportSize(){
     const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
     const fallback = _viewportFallbackSize();
-    const width = viewport.clientWidth || (rect && rect.width) || fallback.width;
-    const height = viewport.clientHeight || (rect && rect.height) || fallback.height;
+    const width = mode === 'lightbox'
+      ? fallback.width
+      : (viewport.clientWidth || (rect && rect.width) || fallback.width);
+    const height = mode === 'lightbox'
+      ? fallback.height
+      : (viewport.clientHeight || (rect && rect.height) || fallback.height);
     return {
       width: Math.max(1, Number(width) || box.width || 1),
       height: Math.max(1, Number(height) || box.height || 1),
@@ -1529,10 +1557,10 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _minScale(){
-    // Lightbox keeps master's flat minimum (unchanged zoom-out floor / fit
-    // bounds). Only inline mode uses the readable-height-derived minimum so a
-    // short inline viewport can't shrink the diagram below usability (#5434).
-    if(mode === 'lightbox') return _MERMAID_VIEWER_MIN_SCALE;
+    // Inline stays bounded by readable-height minimum to preserve usability.
+    // Lightbox allows fit-to-screen to shrink below the old 0.25 floor when
+    // the diagram envelope is narrower than 25%.
+    if(mode === 'lightbox') return Math.min(_MERMAID_VIEWER_MIN_SCALE, _rawFitScale(_viewportSize()));
     return Math.min(_MERMAID_VIEWER_MIN_SCALE, _inlineViewportHeight() / Math.max(1, box.height));
   }
 
@@ -1578,8 +1606,28 @@ function _mountMermaidViewer(svgEl, options = {}) {
 
   function _fitViewer(){
     const nextScale = _fitScale();
+    state.fitScale = nextScale;
     state.scale = nextScale;
     _centerForScale(nextScale);
+    _applyTransform();
+  }
+
+  function _resizeToEnvelope(){
+    if(mode !== 'lightbox') return;
+    const hadFitScale = Number.isFinite(state.fitScale);
+    const previousFitScale = hadFitScale ? state.fitScale : _fitScale();
+    const wasAtFit = !hadFitScale || Math.abs(state.scale - previousFitScale) < 1e-9;
+    const envelope = _lightboxViewportEnvelope();
+    viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
+    const nextFitScale = _fitScale();
+    state.fitScale = nextFitScale;
+    if(wasAtFit){
+      state.scale = nextFitScale;
+      _centerForScale(state.scale);
+    } else {
+      state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, state.scale));
+    }
     _applyTransform();
   }
 
@@ -1669,6 +1717,7 @@ function _mountMermaidViewer(svgEl, options = {}) {
   state.zoomOut = _zoomOut;
   state.zoomAt = _setScale;
   state.applyTransform = _applyTransform;
+  state.resizeToEnvelope = _resizeToEnvelope;
   state.openLightbox = openLightbox;
 
   toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
@@ -1680,22 +1729,16 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   if(mode === 'lightbox'){
-    // Preserve master's lightbox initialization exactly: fit-to-screen scale
-    // and a viewport envelope sized to the fitted diagram. The inline readable-
-    // height sizing below must NOT leak into lightbox mode (#5434 gate finding).
-    const initialFit = _fitScale();
-    state.scale = initialFit;
-    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
-    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
+    state.resizeToEnvelope();
   } else {
     const initialHeight = _inlineViewportHeight();
     const readableScale = initialHeight / Math.max(1, box.height);
     state.scale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, readableScale));
     viewport.style.width = '100%';
     viewport.style.height = Math.max(1, Math.round(initialHeight)) + 'px';
+    _centerForScale(state.scale);
+    _applyTransform();
   }
-  _centerForScale(state.scale);
-  _applyTransform();
 
   return root;
 }
@@ -1744,6 +1787,18 @@ function _openMermaidLightbox(svgEl) {
   clone.removeAttribute('width');
   clone.removeAttribute('height');
   const viewer = _mountMermaidViewer(clone, {mode:'lightbox'});
+  if(viewer && viewer._mermaidViewer && typeof viewer._mermaidViewer.resizeToEnvelope === 'function'){
+    lb._mermaidResizeHandler = () => {
+      if(lb._mermaidResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._mermaidResizeTimer);
+      lb._mermaidResizeTimer = setTimeout(() => {
+        lb._mermaidResizeTimer = null;
+        viewer._mermaidViewer.resizeToEnvelope();
+      }, 120);
+    };
+    if(window && typeof window.addEventListener === 'function'){
+      window.addEventListener('resize', lb._mermaidResizeHandler);
+    }
+  }
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
@@ -1757,6 +1812,7 @@ function _openMermaidLightbox(svgEl) {
   };
   document.body.appendChild(lb);
   document.addEventListener('keydown', lb._keyHandler);
+  return lb;
 }
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
@@ -1827,6 +1883,13 @@ function _navigateLightbox(lb, direction) {
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
   document.removeEventListener('keydown', lb._keyHandler);
+  if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._mermaidResizeHandler);
+  }
+  if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._mermaidResizeTimer);
+    lb._mermaidResizeTimer = null;
+  }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
 }
@@ -10531,11 +10594,26 @@ function _anchorSceneNodeForRow(row, opts){
   if(row.role==='prose'){
     const text=String(row.text||'').trim();
     if(!text) return null;
-    node=document.createElement('div');
-    node.className='assistant-segment';
-    node.setAttribute('data-anchor-scene-prose','1');
-    node.dataset.rawText=text;
-    node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    // Incremental live rendering: reuse a persistent smd node fed only the delta
+    // instead of re-parsing the whole growing answer on every streamed frame
+    // (O(n^2) -> O(n)). Settled rows and any failure fall through to the full
+    // renderMd path below, which stays the source of truth for the final DOM.
+    const proseKey=row.local_id||row.row_id||'';
+    if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
+      const inc=window.__anchorProseIncrementalNode(proseKey,text);
+      // Route the incremental node through the shared row-decoration block below
+      // (data-anchor-scene-row / -row-id / -row-role / -source-event-type) instead
+      // of returning early — otherwise live incremental prose rows lose the
+      // identity attributes the scene reconciler matches on. (Codex gate #5466)
+      if(inc){ node=inc; }
+    }
+    if(!node){
+      node=document.createElement('div');
+      node.className='assistant-segment';
+      node.setAttribute('data-anchor-scene-prose','1');
+      node.dataset.rawText=text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+    }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
     const text=String(row.text||row.thinking&&row.thinking.text||'').trim();
@@ -13255,7 +13333,10 @@ function renderMessages(options){
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
-    const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const readOnlySession=typeof _isReadOnlySession==='function'
+      ? _isReadOnlySession(S.session)
+      : !!(S.session&&(S.session.read_only||S.session.is_read_only));
+    const forkBtn  = readOnlySession ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
