@@ -201,7 +201,8 @@ else initOfflineMonitor();
 // Redirect to login when the server responds with 401 (auth session expired).
 // Handles iOS PWA standalone mode and keeps subpath mounts like /hermes/ from
 // escaping to the personal site root /login.
-function _redirectIfUnauth(res){if(res&&res.status===401){window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);return true;}return false;}
+// #5578: on a login-shaped page, reload 'login' WITHOUT a next (avoid self-nesting).
+function _redirectIfUnauth(res){if(res&&res.status===401){var _p=(window.location.pathname||'').replace(/\/+$/,'');if(/(?:^|\/)login$/.test(_p)){window.location.href='login';}else{window.location.href='login?next='+encodeURIComponent(window.location.pathname+window.location.search);}return true;}return false;}
 function _getSessionQueue(sid, create=false){
   if(!sid) return [];
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
@@ -759,11 +760,35 @@ function _messageVisibleIndexForRawIdx(rawIdx, visWithIdx){
   }
   return -1;
 }
+function _safeEncodeURIComponent(v){
+  try{return encodeURIComponent(String(v));}
+  catch(e){
+    // encodeURIComponent threw URIError -> one or more lone UTF-16 surrogates.
+    // Walk the string as UTF-16 code units: keep valid high(D800-DBFF) +
+    // low(DC00-DFFF) pairs intact (so emoji survive) and drop lone surrogates.
+    // No regex lookbehind/lookahead so this parses on every browser engine
+    // (some older WebViews / Safari <16.4 don't support lookbehind in regex
+    // literals, which would otherwise brick ui.js at parse time).
+    const s=String(v);
+    let cleaned='';
+    for(let i=0;i<s.length;i++){
+      const c=s.charCodeAt(i);
+      if(c>=0xD800&&c<=0xDBFF){
+        const n=(i+1<s.length)?s.charCodeAt(i+1):0;
+        if(n>=0xDC00&&n<=0xDFFF){cleaned+=s[i]+s[i+1];i++;}
+      }else if(c<0xDC00||c>0xDFFF){
+        cleaned+=s[i];
+      }
+    }
+    return encodeURIComponent(cleaned);
+  }
+}
+
 function _messageViewportAnchorKeyForMessage(m){
   if(typeof _compressionMessageAnchorKey!=='function') return '';
   const key=_compressionMessageAnchorKey(m);
   if(!key) return '';
-  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>encodeURIComponent(String(v))).join('|');
+  return [key.role||'',key.ts??'',key.attachments??0,key.text||''].map(v=>_safeEncodeURIComponent(v)).join('|');
 }
 function _messageVisibleIndexForAnchorKey(anchorKey, visWithIdx){
   const key=String(anchorKey||'');
@@ -1421,7 +1446,7 @@ function _mermaidViewerIcon(kind) {
     zoomOut: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"></circle><path d="M7 10h6"></path><path d="M15 15l4 4"></path></svg>',
     reset: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9V4H1"></path><path d="M1 4l4 4"></path><path d="M10 4a8 8 0 1 1-5.66 13.66"></path></svg>',
     fit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg>',
-    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"></path></svg>',
+    fullscreen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path><path d="M4 4l5 5M20 4l-5 5M4 20l5-5M20 20l-5-5"></path></svg>',
   };
   return icons[kind] || '';
 }
@@ -4858,6 +4883,10 @@ if(typeof window!=='undefined'){
       }else if(movedDown&&nearBottom){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
+          // Only re-pin when the reader has genuinely reached the true bottom
+          // tail (<=80px). nearBottom spans a ~250px band, so proximity alone
+          // must NOT clear the sticky unpin flag (#4295) — a reader scanning the
+          // last lines mid-stream would otherwise get yanked back to the bottom.
           if(!_messageUserUnpinned||bottomDistance<=80){
             _messageUserUnpinned=false;
             _scrollPinned=true;
@@ -5516,7 +5545,24 @@ function _settleFinalScroll(token){
 }
 function scrollIfPinned(){
   if(!_autoScrollFollow) return;
-  if(_messageUserUnpinned) return;
+  if(_messageUserUnpinned){
+    // Only scrollToBottom() cleared this flag, so one scroll-up permanently
+    // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
+    // the true bottom tail (<=80px), NOT on mere near-bottom proximity — the
+    // #4295 invariant is that proximity alone (inside the ~250px band) must not
+    // re-pin, or a reader scanning the last few lines gets yanked to the bottom
+    // mid-stream. Also bail on ANY recent message-pane scroll intent (wheel,
+    // key, touch) and non-message intent, so an active scroll-up near the tail
+    // is never overridden. Uses the same _nearBottomCount debounce as the
+    // scroll listener (~4859-4866).
+    if(_recentNonMessageScrollIntent()||_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent()){ _nearBottomCount=0; return; }
+    if(_messageBottomDistance()>80){ _nearBottomCount=0; return; }
+    _nearBottomCount=_nearBottomCount+1;
+    if(_nearBottomCount<2) return;
+    _nearBottomCount=0;
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+  }
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
   if(_messageBottomDistance()>500) _setMessageScrollToBottom();
@@ -10721,7 +10767,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     node=_decorateTransparentEventRow(buildToolCard(toolCall),{
       type:'tool',
       name:toolCall&&toolCall.name,
-      status:_transparentToolStatus(toolCall,true),
+      status:_transparentToolStatus(toolCall,settled),
       toolCall,
       ...meta,
     });
