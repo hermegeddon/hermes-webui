@@ -42,6 +42,12 @@ from api.agent_sessions import (
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
+from api.compression_recovery import (
+    COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
+    clear_compression_recovery,
+    compression_recovery_payload_for_session,
+    is_generic_continuation_intent,
+)
 from api.session_events import (
     add_session_list_changed_listener,
     publish_session_list_changed,
@@ -7554,14 +7560,28 @@ def _load_branch_source_or_refuse(handler, sid: str):
         bad(handler, "Subagent sessions are view-only and cannot be branched from WebUI", 400)
         return None
     try:
-        return get_session(sid)
+        source = get_session(sid)
     except KeyError:
         _foreign_session, _reason = _claim_or_synthesize_cli_session(sid)
-        if _reason == "not_claimable":
-            bad(handler, "Read-only sessions cannot be branched from WebUI", 403)
-            return None
+        _source_kind = str((getattr(_foreign_session, "source_tag", None) or getattr(_foreign_session, "raw_source", None) or getattr(_foreign_session, "source", None) or "")).strip().lower() if _foreign_session is not None else ""
+        if _reason == "not_claimable" and _foreign_session is not None and _source_kind == "cron":
+            _foreign_session._branch_source_readonly = True; return _foreign_session
+        if _reason == "not_claimable": bad(handler, "Read-only sessions cannot be branched from WebUI", 403); return None
         bad(handler, "Session not found", 404)
         return None
+    # A PERSISTED (stored) session can also be read-only (e.g. a cron-owned or
+    # messaging-sourced sidecar). Apply the SAME read-only branch gate as the
+    # synthesized path: allow forking only a canonical-cron read-only source
+    # (server-authoritative source kind, not the id prefix), marking it so the fork
+    # never .save()s the read-only source; refuse every other read-only source.
+    if bool(getattr(source, "read_only", False)):
+        _source_kind = str((getattr(source, "source_tag", None) or getattr(source, "raw_source", None) or getattr(source, "source", None) or "")).strip().lower()
+        if _source_kind == "cron":
+            source._branch_source_readonly = True
+            return source
+        bad(handler, "Read-only sessions cannot be branched from WebUI", 403)
+        return None
+    return source
 
 
 def _resolve_cli_import_metadata(session_id: str, *, requested_profile=None, allow_all_profiles: bool = False) -> dict:
@@ -8144,6 +8164,11 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     parent_id = str(getattr(session, "parent_session_id", "") or "").strip()
     if not parent_id:
         return primary_messages
+    if (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip()
+        and str(getattr(session, "compression_recovery_action", "") or "").strip()
+    ):
+        return primary_messages
     source = str(getattr(session, "session_source", "") or "").strip().lower()
     relationship = str(getattr(session, "relationship_type", "") or "").strip().lower()
     if source == "fork" or relationship == "child_session":
@@ -8602,6 +8627,7 @@ def _keep_latest_messaging_session_per_source(
 from api.models import (
     Session,
     get_session,
+    find_compression_recovery_session,
     get_session_for_file_ops,
     new_session,
     all_sessions,
@@ -8641,6 +8667,9 @@ from api.models import (
     is_cron_session,
     is_safe_session_id,
 )
+
+
+_COMPRESSION_RECOVERY_START_LOCK = threading.Lock()
 
 
 def _pre_compression_continuation_session_id(session) -> str | None:
@@ -13191,6 +13220,9 @@ def handle_post(handler, parsed) -> bool:
             )
         return j(handler, {"session": s.compact() | {"messages": s.messages}})
 
+    if parsed.path == "/api/session/compression-recovery/start":
+        return _handle_session_compression_recovery_start(handler, body)
+
     if parsed.path == "/api/session/duplicate":
         try:
             sid = body.get("session_id")
@@ -13947,7 +13979,7 @@ def handle_post(handler, parsed) -> bool:
         # /api/session so frontend keep_count values from merged messaging
         # transcripts do not silently become full sidecar copies.
         try:
-            source.save()
+            if not getattr(source, "_branch_source_readonly", False): source.save()
         except Exception:
             pass
         cli_meta = _lookup_cli_session_metadata(source.session_id) if _session_requires_cli_metadata_lookup(source) else {}
@@ -19879,6 +19911,103 @@ def _handle_bg_task_complete_ack(handler, body):
     )
 
 
+def _handle_session_compression_recovery_start(handler, body):
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    sid = str(body.get("session_id") or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required")
+    if _session_is_subagent_view_only(sid):
+        return bad(handler, "Subagent sessions are view-only and cannot start compression recovery from WebUI", 400)
+    try:
+        source = get_session(sid)
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    if not _session_visible_to_active_profile(getattr(source, "profile", None), handler):
+        return bad(handler, "Session not found", 404)
+    recovery = compression_recovery_payload_for_session(source)
+    if not recovery:
+        return bad(handler, "Session does not have a compression recovery action.", 409)
+    action = str(recovery.get("recommended_action") or "")
+    if action != COMPRESSION_RECOVERY_ACTION_START_FOCUSED:
+        return bad(handler, "Unsupported compression recovery action.", 409)
+
+    created = False
+    with _COMPRESSION_RECOVERY_START_LOCK:
+        source_profile = getattr(source, "profile", None)
+        copied_session = find_compression_recovery_session(sid, action, source_profile=source_profile)
+        if copied_session is None:
+            title = str(getattr(source, "title", None) or "Untitled").strip() or "Untitled"
+            if not title.endswith(" (focused continuation)"):
+                title = f"{title} (focused continuation)"
+            copied_session = Session(
+                session_id=uuid.uuid4().hex[:12],
+                title=title,
+                workspace=getattr(source, "workspace", get_last_workspace()),
+                model=getattr(source, "model", None),
+                model_provider=getattr(source, "model_provider", None),
+                messages=[],
+                tool_calls=[],
+                pinned=False,
+                archived=False,
+                project_id=getattr(source, "project_id", None),
+                profile=getattr(source, "profile", None),
+                session_source="fork",
+                personality=getattr(source, "personality", None),
+                enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
+                context_length=getattr(source, "context_length", None),
+                threshold_tokens=getattr(source, "threshold_tokens", None),
+                gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+                gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
+                parent_session_id=getattr(source, "session_id", sid),
+                worktree_path=getattr(source, "worktree_path", None),
+                worktree_branch=getattr(source, "worktree_branch", None),
+                worktree_repo_root=getattr(source, "worktree_repo_root", None),
+                worktree_created_at=getattr(source, "worktree_created_at", None),
+                compression_recovery_source_session_id=sid,
+                compression_recovery_action=action,
+            )
+            # Preserve the workspace/model/profile lane, but intentionally start with an
+            # empty model-facing transcript so a focused follow-up does not replay the
+            # exhausted state.db/context tail.
+            copied_session.context_messages = []
+            copied_session.composer_draft = {"text": "", "files": []}
+            try:
+                copied_session.save()
+            except Exception as e:
+                logger.exception("failed to persist compression recovery session for %s", sid)
+                return bad(handler, f"Failed to start compression recovery: {_sanitize_error(e)}", 500)
+
+            with LOCK:
+                SESSIONS[copied_session.session_id] = copied_session
+                SESSIONS.move_to_end(copied_session.session_id)
+                _evict_sessions_over_cap()
+            created = True
+    if created:
+        publish_session_list_changed(
+            "session_compression_recovery",
+            profile=getattr(copied_session, "profile", None),
+            session_id=getattr(copied_session, "session_id", None),
+        )
+    session_payload = redact_session_data(copied_session.compact() | {"messages": copied_session.messages})
+    return j(
+        handler,
+        {
+            "ok": True,
+            "session": session_payload,
+            "source_session_id": sid,
+            "recommended_recovery_action": action,
+            "message": (
+                "Started a focused continuation. Describe the next narrow task to continue."
+                if created
+                else "Opened the existing focused continuation for this exhausted session."
+            ),
+        },
+    )
+
+
 def _handle_goal_command(handler, body):
     """Handle WebUI /goal command controls and optional kickoff stream."""
     try:
@@ -20134,6 +20263,19 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
+        recovery = compression_recovery_payload_for_session(s)
+        if recovery and not attachments and is_generic_continuation_intent(msg):
+            return j(
+                handler,
+                {
+                    "error": "This session exhausted context compression. Start a focused continuation, then describe the next narrow task.",
+                    "type": "compression_recovery_required",
+                    "recommended_recovery_action": recovery.get("recommended_action"),
+                    "compression_recovery": recovery,
+                    "session_id": getattr(s, "session_id", body["session_id"]),
+                },
+                status=409,
+            )
         diag.stage("resolve_workspace") if diag else None
         try:
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
@@ -20193,16 +20335,43 @@ def _handle_chat_start(handler, body, diag=None):
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
-        response = _start_run(
-            s,
-            **start_run_kwargs,
-        )
+        recovery_cleared_for_start = None
+        def _restore_cleared_recovery():
+            if recovery_cleared_for_start is None:
+                return None
+            s.compression_recovery = recovery_cleared_for_start
+            s.recommended_recovery_action = recovery_cleared_for_start.get("recommended_action")
+            try:
+                s.save()
+            except Exception as restore_err:
+                logger.exception("failed to restore compression recovery after chat start rejection for %s", getattr(s, "session_id", None))
+                return restore_err
+            return None
+
+        if recovery:
+            recovery_cleared_for_start = copy.deepcopy(recovery)
+            clear_compression_recovery(s)
+        try:
+            response = _start_run(
+                s,
+                **start_run_kwargs,
+            )
+        except Exception:
+            _restore_cleared_recovery()
+            raise
         # Map adapter-selection NotImplementedError (501) onto the legacy
         # bad-request response shape that this route exposed historically
         # before the helper extraction.
         if response.get("_status") == 501 and "error" in response:
+            restore_err = _restore_cleared_recovery()
+            if restore_err is not None:
+                return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
             return j(handler, {"error": response["error"]}, status=501)
         status = int(response.pop("_status", 200) or 200)
+        if status >= 400 and recovery_cleared_for_start is not None:
+            restore_err = _restore_cleared_recovery()
+            if restore_err is not None:
+                return bad(handler, f"failed to restore compression recovery: {_sanitize_error(restore_err)}", 500)
         diag.stage("response_write") if diag else None
         return j(handler, response, status=status)
     finally:

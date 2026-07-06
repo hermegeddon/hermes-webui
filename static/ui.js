@@ -418,6 +418,109 @@ function _statusCardHtml(card){
   </div>`;
 }
 
+function _compressionRecoveryHtml(recovery, sessionId){
+  if(!recovery||typeof recovery!=='object') return '';
+  if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
+  const action=String(recovery.recommended_action||'');
+  if(action!=='start_focused_continuation') return '';
+  const sid=String(recovery.source_session_id||sessionId||'');
+  const title=String(recovery.title||'Context compression exhausted');
+  const summary=String(recovery.summary||'Start a focused continuation, then describe the next narrow task.');
+  const actionLabel=String(recovery.action_label||'Start focused continuation');
+  const icon=(typeof li==='function')?li('git-branch',14):'';
+  return `<div class="compression-recovery-card" data-compression-recovery-card="1">
+    <div class="compression-recovery-copy">
+      <div class="compression-recovery-title">${esc(title)}</div>
+      <div class="compression-recovery-summary">${esc(summary)}</div>
+    </div>
+    <button class="compression-recovery-action" type="button" data-recovery-session-id="${esc(sid)}" onclick="startCompressionRecovery(this);event.stopPropagation()">${icon}<span>${esc(actionLabel)}</span></button>
+  </div>`;
+}
+
+function _activeCompressionRecoveryPayload(){
+  if(!S||!S.session) return null;
+  const recovery=S.session.compression_recovery;
+  if(recovery&&typeof recovery==='object'&&String(recovery.terminal_state||'')==='compression_exhausted') return recovery;
+  // A cleared session-level recovery payload is authoritative. Only scan
+  // message metadata for older sessions that never exposed this field.
+  if(Object.prototype.hasOwnProperty.call(S.session,'compression_recovery')) return null;
+  const messages=Array.isArray(S.messages)?S.messages:[];
+  for(let i=messages.length-1;i>=0;i--){
+    const msg=messages[i];
+    const msgRecovery=msg&&msg._compressionRecovery;
+    if(msgRecovery&&typeof msgRecovery==='object'&&String(msgRecovery.terminal_state||'')==='compression_exhausted') return msgRecovery;
+  }
+  return null;
+}
+
+function isGenericCompressionContinuationIntent(text){
+  const raw=String(text||'').trim().toLowerCase();
+  if(!raw) return false;
+  const normalized=raw.replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+  const generic=new Set(['continue','continue please','go on','keep going','resume','proceed','carry on','继续','继续吧','接着','接着做','继续做','继续执行']);
+  if(generic.has(normalized)) return true;
+  const parts=normalized.split(/\s+/).filter(Boolean);
+  return !!parts.length&&parts.length<=2&&parts.every(part=>generic.has(part));
+}
+
+function shouldInterceptCompressionRecoveryContinuation(text, files){
+  const hasFiles=Array.isArray(files)&&files.length>0;
+  if(hasFiles||!isGenericCompressionContinuationIntent(text)) return false;
+  const recovery=_activeCompressionRecoveryPayload();
+  return !!(recovery&&String(recovery.recommended_action||'')==='start_focused_continuation');
+}
+
+function showCompressionRecoveryContinuationHint(){
+  const card=document.querySelector('[data-compression-recovery-card="1"]');
+  if(card&&typeof card.scrollIntoView==='function'){
+    try{card.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){card.scrollIntoView();}
+    const btn=card.querySelector('.compression-recovery-action');
+    if(btn&&typeof btn.focus==='function') setTimeout(()=>btn.focus(),120);
+  }
+  if(typeof showToast==='function') showToast('This session exhausted context compression. Start a focused continuation, then describe the next narrow task.',4500,'warning');
+}
+
+async function startCompressionRecovery(btn){
+  const sourceSid=String((btn&&btn.dataset&&btn.dataset.recoverySessionId)||(S.session&&S.session.session_id)||'').trim();
+  if(!sourceSid) return;
+  let retiredRecoveryCard=false;
+  if(btn){btn.disabled=true;btn.classList.add('loading');}
+  try{
+    const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
+    const sid=data&&data.session&&data.session.session_id;
+    if(!sid) throw new Error('Compression recovery did not return a session.');
+    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
+    if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
+    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
+    if(typeof renderSessionList==='function') await renderSessionList();
+    if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
+    if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
+    const composer=$('msg');
+    if(composer&&typeof composer.focus==='function') composer.focus();
+  }catch(e){
+    // A 409 means this session no longer has an active recovery action (the
+    // session already moved on — e.g. a substantive prompt cleared it). The
+    // persisted card in the transcript is stale, so retire it and show a neutral
+    // note instead of a raw error. The server is authoritative on availability.
+    if(e&&e.status===409){
+      const staleCard=(btn&&btn.closest&&btn.closest('.compression-recovery-card'))
+        ||document.querySelector('[data-compression-recovery-card="1"]');
+      if(staleCard){
+        staleCard.setAttribute('data-compression-recovery-consumed','1');
+        const staleBtn=staleCard.querySelector('.compression-recovery-action');
+        if(staleBtn){staleBtn.disabled=true;staleBtn.classList.remove('loading');}
+        retiredRecoveryCard=true;
+      }
+      if(typeof showToast==='function') showToast('This conversation already moved on — the focused-continuation action is no longer available.',4000,'info');
+      return;
+    }
+    if(typeof showToast==='function') showToast('Compression recovery failed: '+(e&&e.message||e),5000,'error');
+  }finally{
+    // Do NOT re-enable a button we deliberately retired in the 409 branch.
+    if(btn){if(!retiredRecoveryCard) btn.disabled=false;btn.classList.remove('loading');}
+  }
+}
+
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS=80;
 const MESSAGE_VIRTUAL_BUFFER_PX=900;
@@ -1355,12 +1458,82 @@ function _dashboardBrowserUrl(status){
   const displayHost=browserHost.includes(':')&&!browserHost.startsWith('[')?'['+browserHost+']':browserHost;
   return source.protocol+'//'+displayHost+':'+status.port;
 }
+function _stripInlineEventHandlers(node){
+  if(!node)return;
+  const strip=el=>{
+    Array.from(el.attributes||[]).forEach(attr=>{
+      if(attr.name&&attr.name.toLowerCase().startsWith('on'))el.removeAttribute(attr.name);
+    });
+    if('onclick' in el)el.onclick=null;
+    Array.from(el.children||[]).forEach(strip);
+  };
+  strip(node);
+}
+function _syncNavActionMirrors(){
+  const rail=document.querySelector('.rail');
+  const sidebar=document.querySelector('.sidebar-nav');
+  if(!rail||!sidebar)return;
+  const sources=Array.from(rail.querySelectorAll('.nav-tab:not([data-panel]):not([data-dashboard-link])')).filter(source=>source.id);
+  const mirrors=Array.from(sidebar.querySelectorAll('[data-nav-action-mirror]'));
+  const sourceIds=new Set(sources.map(source=>source.id));
+  mirrors.forEach(mirror=>{
+    if(!sourceIds.has(mirror.getAttribute('data-nav-action-mirror')))mirror.remove();
+  });
+  sources.forEach(source=>{
+    const sourceVisible=(()=>{
+      if(source.hidden||source.getAttribute('aria-hidden')==='true')return false;
+      if(source.classList.contains('nav-tab-hidden'))return false;
+      if(source.style&&(source.style.display==='none'||source.style.visibility==='hidden'))return false;
+      if(typeof window!=='undefined'&&typeof window.getComputedStyle==='function'){
+        const computed=window.getComputedStyle(source);
+        if(computed&&(computed.display==='none'||computed.visibility==='hidden'))return false;
+      }
+      return true;
+    })();
+    let mirror=mirrors.find(el=>el.getAttribute('data-nav-action-mirror')===source.id);
+    if(!mirror){
+      mirror=source.cloneNode(true);
+      _stripInlineEventHandlers(mirror);
+      mirror.id=source.id+'Mobile';
+      mirror.classList.remove('rail-btn');
+      mirror.classList.add('has-tooltip--bottom');
+      mirror.setAttribute('data-nav-action-mirror',source.id);
+      mirror.addEventListener('click',e=>{
+        e.preventDefault();
+        if(mirror._navActionSource)mirror._navActionSource.click();
+        if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+      });
+      const anchor=sidebar.querySelector('.dashboard-link,[data-dashboard-link]')||sidebar.querySelector('[data-panel="logs"]');
+      sidebar.insertBefore(mirror,anchor||null);
+    }else{
+      mirror.innerHTML=source.innerHTML;
+      _stripInlineEventHandlers(mirror);
+    }
+    mirror._navActionSource=source;
+    mirror.classList.toggle('nav-action-visible',sourceVisible);
+    const label=source.getAttribute('data-tooltip')||source.getAttribute('aria-label')||'';
+    if(label)mirror.setAttribute('data-label',label);
+  });
+}
+function _initNavActionMirrors(){
+  _syncNavActionMirrors();
+  const rail=document.querySelector('.rail');
+  if(rail&&window.MutationObserver)new MutationObserver(_syncNavActionMirrors).observe(rail,{
+    childList:true,
+    subtree:true,
+    attributes:true,
+    attributeFilter:['class','style','hidden','aria-hidden','data-tooltip','aria-label'],
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',_initNavActionMirrors,{once:true});
+else _initNavActionMirrors();
 function _applyDashboardStatus(status){
   const running=!!(status&&status.running);
   const url=running?_dashboardBrowserUrl(status):'';
   const warning=running&&!_dashboardIsBrowserLoopback()?t('dashboard_loopback_warning'):'';
   document.querySelectorAll('[data-dashboard-link]').forEach(btn=>{
     btn.classList.toggle('dashboard-link-visible',running);
+    btn.classList.toggle('nav-action-visible',running);
     btn.style.display=running?'':'none';
     btn.dataset.dashboardUrl=url;
     const tipText=warning||t('tab_dashboard');
@@ -2496,23 +2669,41 @@ function _refreshOpenModelDropdown(){
     renderModelDropdown();
     if(typeof _positionModelDropdown==='function') _positionModelDropdown();
   }
+  const sdd=$('settingsModelDropdown');
+  if(sdd&&sdd.classList&&sdd.classList.contains('open')&&typeof renderModelDropdown==='function'){
+    // Re-rendering the OPEN settings picker (e.g. when a late live-model fetch
+    // resolves) must not re-grab search focus on touch — same coarse-pointer rule
+    // as openSettingsModelDropdown, or the mobile keyboard pops after opening.
+    const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+    renderModelDropdown({
+      dropdownId:'settingsModelDropdown',
+      selectId:'settingsModel',
+      forceOpenKey:'settingsModel',
+      closeDropdown:closeSettingsModelDropdown,
+      selectModel:selectSettingsModelFromDropdown,
+      scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+      autoFocusSearch:!_coarsePointer,
+    });
+  }
 }
 function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
   if(!modelId||!sel) return null;
-  const currentState=(sel.id==='modelSelect'&&typeof _modelStateForSelect==='function')
+  const isRichPickerSelect=sel.id==='modelSelect'||sel.id==='settingsModel';
+  const currentState=(isRichPickerSelect&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, sel.value)
     : null;
   const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
-    if(sel.id==='modelSelect'){
+    if(isRichPickerSelect){
       const resolvedState=typeof _modelStateForSelect==='function'
         ? _modelStateForSelect(sel, resolved)
         : {model:resolved,model_provider:preferredProviderId||null};
       const pickerChanged= !!(opts&&opts.forceRefresh) || !currentState
         || String(currentState.model||'')!==String(resolvedState.model||'')
         || String(currentState.model_provider||'')!==String(resolvedState.model_provider||'');
-      if(typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='modelSelect'&&typeof syncModelChip==='function') syncModelChip();
+      if(sel.id==='settingsModel'&&typeof syncSettingsModelChip==='function') syncSettingsModelChip();
       if(pickerChanged) _refreshOpenModelDropdown();
     }
     return resolved;
@@ -2536,6 +2727,10 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   sel.value=modelId;
   if(sel.id==='modelSelect'){
     if(typeof syncModelChip==='function') syncModelChip();
+    _refreshOpenModelDropdown();
+  }
+  if(sel.id==='settingsModel'){
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
     _refreshOpenModelDropdown();
   }
   return modelId;
@@ -3144,9 +3339,20 @@ function _mountSearchableModelSelect(opts={}){
 }
 
 function renderModelDropdown(){
-  const dd=$('composerModelDropdown');
-  const sel=$('modelSelect');
+  const opts=arguments[0]||{};
+  const dd=$(opts.dropdownId||'composerModelDropdown');
+  const sel=$(opts.selectId||'modelSelect');
   if(!dd||!sel) return;
+  // Whether the search input should auto-grab focus on (re-)render. Default true
+  // preserves the composer picker's behavior exactly; the settings picker passes
+  // false on coarse-pointer devices so opening it doesn't pop the mobile keyboard.
+  const _autoFocusSearch=opts.autoFocusSearch!==false;
+  const selectFromDropdown=typeof opts.selectModel==='function'
+    ? opts.selectModel
+    : (value,provider)=>selectModelFromDropdown(value,provider);
+  const closeDropdown=typeof opts.closeDropdown==='function'
+    ? opts.closeDropdown
+    : closeModelDropdown;
   // Group(s) that must render OPEN even though they aren't the selected group —
   // set when the user expands a group's overflow via "Show more" so a later full
   // re-render doesn't re-collapse it (_groupOpenState is rebuilt per render, so
@@ -3155,8 +3361,10 @@ function renderModelDropdown(){
   // #3691 node test driver evals the function body without module scope).
   const _forceOpenGroups=(()=>{
     const _g=(typeof window!=='undefined')?window:(typeof globalThis!=='undefined'?globalThis:{});
-    if(!_g.__modelGroupForceOpen) _g.__modelGroupForceOpen=new Set();
-    return _g.__modelGroupForceOpen;
+    const key=opts.forceOpenKey||'composer';
+    if(!_g.__modelGroupForceOpenByPicker) _g.__modelGroupForceOpenByPicker={};
+    if(!_g.__modelGroupForceOpenByPicker[key]) _g.__modelGroupForceOpenByPicker[key]=new Set();
+    return _g.__modelGroupForceOpenByPicker[key];
   })();
   const _modelData=[];
   const _groupMeta=new Map();
@@ -3253,7 +3461,7 @@ function renderModelDropdown(){
   // Create search input FIRST before filterModels definition
   const _scopeNote=document.createElement('div');
   _scopeNote.className='model-scope-note';
-  _scopeNote.textContent=t('model_scope_advisory')||'Applies to this conversation from your next message.';
+  _scopeNote.textContent=opts.scopeNoteText||(t('model_scope_advisory')||'Applies to this conversation from your next message.');
   const _searchRow=document.createElement('div');
   _searchRow.className='model-search-row';
   _searchRow.innerHTML=`<input class="model-search-input" type="text" placeholder="${esc(t('model_search_placeholder')||'Search models…')}" spellcheck="false" autocomplete="off"><button class="model-search-clear" title="Clear search">${li('x',10)}</button>`;
@@ -3293,7 +3501,7 @@ function renderModelDropdown(){
     const _plainGroup=m.group?String(m.group).replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,''):'';
     const providerChip=(_plainGroup&&withProviderChip)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _expandOverflowGroup=(groupMetaEntry)=>{
@@ -3317,7 +3525,7 @@ function renderModelDropdown(){
     // expander gone, search term reapplied.
     const _fullReRender=()=>{
       const _term=(_si&&_si.value)||'';
-      renderModelDropdown();
+      renderModelDropdown(opts);
       const ns=dd.querySelector('.model-search-input');
       if(ns){ ns.value=_term; (ns._listeners&&ns._listeners.input)?ns._listeners.input():ns.dispatchEvent(new Event('input')); }
     };
@@ -3346,7 +3554,7 @@ function renderModelDropdown(){
       for(const m of extraModels){
         if(!m||!m.id) continue;
         if(_alreadyShown.has(esc(m.id))) continue;
-        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},$('modelSelect'),false);
+        const row=_buildModelRow({value:m.id,name:m.label||m.id,id:m.id,group:_plainLabel,groupKey,providerId:(og.dataset&&og.dataset.provider)||''},sel,false);
         wrap.insertBefore(row,moreEl);
         if(!firstNewRow) firstNewRow=row;
       }
@@ -3412,10 +3620,14 @@ function renderModelDropdown(){
     const _underOwnHeading=shouldRenderHeading&&!!(m.groupKey&&_groupWrappers[m.groupKey]);
     const providerChip=(_plainGroup&&!_underOwnHeading)?`<span class="model-opt-provider">${esc(_plainGroup)}</span>`:'';
     row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-    row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+    row.onclick=()=>selectFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
     return row;
   };
   const _filterModels=(term)=>{
+    // Preserve focus across the re-render if the search input already had it — so a
+    // touch user typing a query (where autoFocusSearch is suppressed to avoid the
+    // initial keyboard pop) doesn't lose focus mid-word on each keystroke re-render.
+    const _hadFocus=(typeof document!=='undefined')&&document.activeElement===_si;
     term=term.trim().toLowerCase();
     const hasSearch=!!term;
     // On a fresh search, expand all groups so every match is visible (#collapse).
@@ -3507,7 +3719,7 @@ function renderModelDropdown(){
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
         row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
+        row.onclick=()=>selectFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
         dd.appendChild(row);
       }
     }
@@ -3654,7 +3866,7 @@ function renderModelDropdown(){
       noResult.style.textAlign='center';
       dd.appendChild(noResult);
     }
-    _si.focus();
+    if(_autoFocusSearch||_hadFocus) _si.focus();
   };
   _si.addEventListener('input',()=>_filterModels(_si.value));
   // Keyboard navigation through filtered model rows (#2791).
@@ -3675,7 +3887,7 @@ function renderModelDropdown(){
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
   };
   _si.addEventListener('keydown',e=>{
-    if(e.key==='Escape'){closeModelDropdown();return;}
+    if(e.key==='Escape'){closeDropdown();return;}
     if(e.key==='ArrowDown'||e.key==='ArrowUp'||e.key==='Enter'){
       const rows=_visibleModelRows();
       if(!rows.length){if(e.key==='Enter') e.preventDefault();return;}
@@ -3692,9 +3904,9 @@ function renderModelDropdown(){
   _si.addEventListener('click',e=>e.stopPropagation());
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
   _sc.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){ _si.value=''; _filterModels(''); _si.focus(); e.preventDefault(); }});
-  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectModelFromDropdown(v);_ci.value='';};
+  const _applyCustom=()=>{const v=_ci.value.trim();if(!v)return;selectFromDropdown(v,null);_ci.value='';};
   _cb.onclick=_applyCustom;
-  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeModelDropdown();}});
+  _ci.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();_applyCustom();}if(e.key==='Escape'){closeDropdown();}});
   _ci.addEventListener('click',e=>e.stopPropagation());
   dd.appendChild(_scopeNote);
   dd.appendChild(_searchRow);
@@ -3759,12 +3971,113 @@ function closeModelDropdown(){
   if(mobileAction) mobileAction.classList.remove('active');
 }
 
+function closeSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const chip=$('settingsModelChip');
+  if(dd) dd.classList.remove('open');
+  if(chip){
+    chip.classList.remove('active');
+    chip.setAttribute('aria-expanded','false');
+  }
+}
+
+function syncSettingsModelChip(){
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!sel||!chip) return;
+  const opt=sel.selectedOptions&&sel.selectedOptions[0];
+  const text=(opt&&opt.textContent)||getModelLabel(sel.value||'')||t('settings_label_model')||'Default Model';
+  chip.textContent=text;
+  chip.title=sel.value||text;
+}
+
+function selectSettingsModelFromDropdown(value,preferredProviderId){
+  const sel=$('settingsModel');
+  if(!sel){closeSettingsModelDropdown();return;}
+  const provider=String(preferredProviderId||'').trim()||null;
+  if(typeof _ensureModelOptionInDropdown==='function'){
+    _ensureModelOptionInDropdown(value,sel,provider);
+  }else{
+    sel.value=value;
+    if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
+  }
+  closeSettingsModelDropdown();
+  try{
+    if(typeof Event==='function') sel.dispatchEvent(new Event('change',{bubbles:true}));
+    else if(typeof sel.onchange==='function') sel.onchange();
+  }catch(_){}
+}
+
+function openSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  const sel=$('settingsModel');
+  const chip=$('settingsModelChip');
+  if(!dd||!sel) return;
+  // Auto-focus the search on desktop only. On touch (coarse pointer) grabbing focus
+  // pops the on-screen keyboard the instant the chip is tapped — the composer picker
+  // doesn't do it either, so match that behavior on touch. Computed before render so
+  // renderModelDropdown's own initial focus is suppressed too (not just the outer one).
+  const _coarsePointer=(typeof window.matchMedia==='function')&&window.matchMedia('(pointer: coarse)').matches;
+  renderModelDropdown({
+    dropdownId:'settingsModelDropdown',
+    selectId:'settingsModel',
+    forceOpenKey:'settingsModel',
+    closeDropdown:closeSettingsModelDropdown,
+    selectModel:selectSettingsModelFromDropdown,
+    scopeNoteText:t('settings_desc_model')||'Used for new conversations. Existing conversations keep their selected model.',
+    autoFocusSearch:!_coarsePointer,
+  });
+  dd.classList.add('open');
+  if(chip){
+    chip.classList.add('active');
+    chip.setAttribute('aria-expanded','true');
+  }
+  if(!_coarsePointer){
+    setTimeout(()=>{
+      const input=dd.querySelector('.model-search-input');
+      if(input) input.focus();
+    },0);
+  }
+}
+
+function toggleSettingsModelDropdown(){
+  const dd=$('settingsModelDropdown');
+  if(dd&&dd.classList.contains('open')){closeSettingsModelDropdown();return;}
+  openSettingsModelDropdown();
+}
+
+function mountSettingsModelPicker(){
+  const chip=$('settingsModelChip');
+  const sel=$('settingsModel');
+  if(!chip||!sel) return;
+  syncSettingsModelChip();
+  if(!chip._settingsModelPickerBound){
+    chip._settingsModelPickerBound=true;
+    chip.addEventListener('click',e=>{
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSettingsModelDropdown();
+    });
+    chip.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '||e.key==='ArrowDown'){
+        e.preventDefault();
+        toggleSettingsModelDropdown();
+      }
+    });
+  }
+}
+
 document.addEventListener('click',e=>{
   if(
     !e.target.closest('#composerModelChip') &&
     !e.target.closest('#composerMobileModelAction') &&
     !e.target.closest('#composerModelDropdown')
   ) closeModelDropdown();
+  if(
+    !e.target.closest('#settingsModelChip') &&
+    !e.target.closest('#settingsModel') &&
+    !e.target.closest('#settingsModelDropdown')
+  ) closeSettingsModelDropdown();
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
@@ -6148,7 +6461,7 @@ function renderMd(raw){
   // Tables: | col | col | header row followed by | --- | --- | separator then data rows
   // NOTE: table pass runs BEFORE outer link pass so [label](url) in table cells
   // is handled by inlineMd() only — prevents double-linking.
-  s=s.replace(/((?:^\|.+\|\n?)+)/gm,block=>{
+  s=s.replace(/((?:^ {0,3}\|.+\|[ \t]*\n?)+)/gm,block=>{
     const rows=block.trim().split('\n').filter(r=>r.trim());
     if(rows.length<2)return block;
     const isSep=r=>/^\|[\s|:-]+\|$/.test(r.trim());
@@ -9297,7 +9610,7 @@ function isTpsDisplayEnabled(){
 function _assistantRoleHtml(tsTitle='', tpsText=''){
   const _bn=assistantDisplayName();
   const tps=(isTpsDisplayEnabled()&&tpsText)?`<span class="msg-tps-inline" title="Tokens per second">${esc(tpsText)}</span>`:'';
-  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span style="font-size:12px">${esc(_bn)}</span>${tps}</div>`;
+  return `<div class="msg-role assistant" ${tsTitle?`title="${esc(tsTitle)}"`:''}><div class="role-icon assistant">${esc(_bn.charAt(0).toUpperCase())}</div><span class="msg-role-name">${esc(_bn)}</span>${tps}</div>`;
 }
 function _setAssistantTurnTps(turn, tpsText=''){
   if(!turn) return;
@@ -11129,8 +11442,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     el.hidden=true;
   });
   const liveFooter=blocks.querySelector('#liveRunStatus');
-  let wrote=false;
-  const targetRenderedRows=[];
+  const renderedRows=[];
   for(const row of rows){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
@@ -11146,8 +11458,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
       : node;
     if(existing) preserveByKey.delete(key);
     if(!renderedNode) continue;
-    targetRenderedRows.push(renderedNode);
-    wrote=true;
+    renderedRows.push(renderedNode);
   }
   const transparentLiveRowAlreadyPositioned=(node, expectedNextSibling)=>!!(
     node &&
@@ -11155,8 +11466,8 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     node.nextSibling===expectedNextSibling
   );
   let expectedNextSibling=(liveFooter&&liveFooter.parentElement===blocks) ? liveFooter : null;
-  for(let i=targetRenderedRows.length-1;i>=0;i--){
-    const renderedNode=targetRenderedRows[i];
+  for(let i=renderedRows.length-1;i>=0;i--){
+    const renderedNode=renderedRows[i];
     if(transparentLiveRowAlreadyPositioned(renderedNode,expectedNextSibling)){
       expectedNextSibling=renderedNode;
       continue;
@@ -11166,7 +11477,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     expectedNextSibling=renderedNode;
   }
   preserveByKey.forEach(stale=>stale.remove());
-  if(wrote) _syncTransparentEventControls(turn);
+  if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
   if(scrollRebuildGuard&&scrollRebuildGuard.release){
@@ -11176,7 +11487,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     });
   }
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
-  return wrote;
+  return !!renderedRows.length;
 }
 
 function _transparentLiveRowKey(node, streamId){
@@ -11271,10 +11582,90 @@ function _refreshTransparentThinkingLiveRow(existing, node){
   return true;
 }
 
+function _bindTransparentFadeCleanup(body){
+  if(!body || body._transparentFadeCleanupBound || typeof body.addEventListener !== 'function') return;
+  body._transparentFadeCleanupBound = true;
+  body.addEventListener('animationend', e=>{
+    const span = e.target;
+    if(!span || !span.classList || !span.classList.contains('stream-fade-word')) return;
+    span.replaceWith(document.createTextNode(span.textContent || ''));
+  });
+}
+
+function _appendTransparentFadeText(body, text){
+  if(!body) return;
+  const value = String(text || '');
+  if(!value) return;
+  _bindTransparentFadeCleanup(body);
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const frag = document.createDocumentFragment();
+  const wordRe = /(\S+)(\s*)/g;
+  let last = 0, match, changed = false;
+  while((match = wordRe.exec(value))){
+    if(match.index > last) frag.appendChild(document.createTextNode(value.slice(last, match.index)));
+    if(reduceMotion){
+      frag.appendChild(document.createTextNode(match[1]));
+    }else{
+      const span = document.createElement('span');
+      span.className = 'stream-fade-word is-new';
+      span.textContent = match[1];
+      frag.appendChild(span);
+    }
+    if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+    last = match.index + match[0].length;
+    changed = true;
+  }
+  if(!changed) frag.appendChild(document.createTextNode(value));
+  else if(last < value.length) frag.appendChild(document.createTextNode(value.slice(last)));
+  body.appendChild(frag);
+}
+
+function _refreshTransparentFadeProseRow(existing, node, preservedState){
+  let body = existing.querySelector ? existing.querySelector('.msg-body') : null;
+  const nextText = String((node.dataset && node.dataset.rawText) || (node.textContent || ''));
+  const currentText = String(existing.getAttribute('data-stream-fade-text') || (body && body.textContent) || '');
+  const pairs = _transparentLiveRowAttributePairs(node);
+  const kept = Object.create(null);
+  for(const pair of pairs){
+    const [name, value] = pair;
+    kept[String(name)] = String(value ?? '');
+  }
+  for(const [name] of _transparentLiveRowAttributePairs(existing)){
+    if(!Object.prototype.hasOwnProperty.call(kept, name)) existing.removeAttribute(name);
+  }
+  for(const pair of pairs){
+    const [name, value] = pair;
+    existing.setAttribute(name, value);
+  }
+  existing.className = node.className || '';
+  if(!body){
+    body = document.createElement('div');
+    body.className = 'msg-body';
+    existing.appendChild(body);
+  }
+  if(body.classList) body.classList.add('stream-fade-active');
+  if(!nextText.startsWith(currentText)){
+    body.textContent = '';
+    existing.setAttribute('data-stream-fade-text', '');
+    _appendTransparentFadeText(body, nextText);
+  }else{
+    _appendTransparentFadeText(body, nextText.slice(currentText.length));
+  }
+  existing.setAttribute('data-stream-fade-text', nextText);
+  _rehydrateTransparentLiveRow(existing, node, preservedState);
+  return existing;
+}
+
 function _refreshTransparentLiveRow(existing, node){
   if(!existing || !node || !existing.getAttribute) return node;
   if(existing===node) return existing;
   const preservedState = _transparentLiveRowInteractiveState(existing);
+  const candidateIsFadeProse = node.getAttribute('data-anchor-row-role') === 'prose' &&
+    node.querySelector &&
+    !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
+  if(candidateIsFadeProse){
+    return _refreshTransparentFadeProseRow(existing, node, preservedState);
+  }
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
   for(const pair of pairs){
@@ -13493,6 +13884,11 @@ function renderMessages(options){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
+    const recoveryPayload=(!isUser&&m._compressionRecovery)
+      ? m._compressionRecovery
+      : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
+    const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
+    if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
@@ -13502,7 +13898,10 @@ function renderMessages(options){
     const readOnlySession=typeof _isReadOnlySession==='function'
       ? _isReadOnlySession(S.session)
       : !!(S.session&&(S.session.read_only||S.session.is_read_only));
-    const forkBtn  = readOnlySession ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
+      ? _isBranchableReadOnlySession(S.session)
+      : false;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -13687,7 +14086,7 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml||recoveryHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
     }else if(hasVisibleBody){
@@ -17404,6 +17803,22 @@ function _showFileContextMenu(e, item){
       }
     };
     menu.appendChild(copyPathItem);
+
+    const copyRelPathItem=document.createElement('div');
+    copyRelPathItem.textContent=t('copy_relative_path');
+    copyRelPathItem.style.cssText='padding:7px 14px;cursor:pointer;font-size:13px;color:var(--text);';
+    copyRelPathItem.onmouseenter=()=>copyRelPathItem.style.background='var(--hover-bg)';
+    copyRelPathItem.onmouseleave=()=>copyRelPathItem.style.background='';
+    copyRelPathItem.onclick=async()=>{
+      menu.remove();
+      try{
+        const rel=_normalizeWorkspaceRelPath(item.path)||item.path;
+        await _copyTextWithFallback(rel,t('path_copied'),t('path_copy_failed'));
+      }catch(err){
+        showToast(t('path_copy_failed')+(err.message||err));
+      }
+    };
+    menu.appendChild(copyRelPathItem);
   }
 
   if(isDirLike){
@@ -17620,8 +18035,49 @@ function addFiles(files){
   }
   renderTray();
 }
+const _uploadPendingFilesProgressBySession=new Map();
 function _uploadPendingFilesCurrentSession(sessionId){
   return !!(!sessionId||(S.session&&S.session.session_id===sessionId));
+}
+function _uploadPendingFilesHideProgressBar(){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  barWrap.classList.remove('active');
+  bar.style.width='0%';
+  if(barWrap.dataset)delete barWrap.dataset.uploadSessionId;
+}
+function _uploadPendingFilesShowProgressBar(owner,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  if(barWrap.dataset)barWrap.dataset.uploadSessionId=owner;
+  barWrap.classList.add('active');
+  bar.style.width=`${Math.max(0,Math.min(100,Number(percent)||0))}%`;
+}
+function _uploadPendingFilesSyncProgressForSession(sessionId){
+  const owner=String(sessionId||'');
+  const state=owner?_uploadPendingFilesProgressBySession.get(owner):null;
+  if(state){_uploadPendingFilesShowProgressBar(owner,state.percent);return;}
+  _uploadPendingFilesHideProgressBar();
+}
+function _uploadPendingFilesUpdateProgress(sessionId,percent){
+  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
+  if(!bar||!barWrap)return;
+  const owner=String(sessionId||'');
+  const activeForOwner=barWrap.dataset&&barWrap.dataset.uploadSessionId===owner;
+  if(percent===null){
+    if(owner)_uploadPendingFilesProgressBySession.delete(owner);
+    if(activeForOwner){
+      _uploadPendingFilesHideProgressBar();
+    }
+    return;
+  }
+  const clamped=Math.max(0,Math.min(100,Number(percent)||0));
+  if(owner)_uploadPendingFilesProgressBySession.set(owner,{percent:clamped});
+  if(!_uploadPendingFilesCurrentSession(sessionId)){
+    if(activeForOwner)_uploadPendingFilesHideProgressBar();
+    return;
+  }
+  _uploadPendingFilesShowProgressBar(owner,clamped);
 }
 async function uploadPendingFiles(options={}){
   const opts=options||{};
@@ -17630,8 +18086,7 @@ async function uploadPendingFiles(options={}){
   if(!pendingFiles.length||!sessionId)return[];
   const clearPending=!(opts&&opts.clearPending===false);
   const names=[];let failures=0;
-  const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
-  barWrap.classList.add('active');bar.style.width='0%';
+  _uploadPendingFilesUpdateProgress(sessionId,0);
   const total=pendingFiles.length;
   for(let i=0;i<total;i++){
     const f=pendingFiles[i];
@@ -17653,9 +18108,9 @@ async function uploadPendingFiles(options={}){
         names.push({name: data.filename, path: data.path, mime: data.mime, size: data.size, is_image: !!data.is_image});
       }
     }catch(e){failures++;setStatus(`\u274c ${t('upload_failed')}${f.name} \u2014 ${e.message}`);}
-    bar.style.width=`${Math.round((i+1)/total*100)}%`;
+    _uploadPendingFilesUpdateProgress(sessionId,Math.round((i+1)/total*100));
   }
-  barWrap.classList.remove('active');bar.style.width='0%';
+  _uploadPendingFilesUpdateProgress(sessionId,null);
   if(clearPending&&_uploadPendingFilesCurrentSession(sessionId)){S.pendingFiles=[];renderTray();}
   else if(typeof renderTray==='function'&&_uploadPendingFilesCurrentSession(sessionId))renderTray();
   if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
