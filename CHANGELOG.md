@@ -3,7 +3,39 @@
 
 ## [Unreleased]
 
+### Internal
+
+- **Centralized WebUI static-asset resolution.** The app-shell (`index.html`), `/static/*`, manifest, service worker, and favicon now resolve through a single shared resolver instead of scattered `__file__`-relative logic — behavior-preserving (same bytes, headers, cache signature, CSRF-per-request injection, and path-traversal rejection), with new resolver regression tests. Thanks @rodboev. (#5557, #2695)
+
+- **Documented the lock-free GIL-atomic contract for the streaming `STREAM_*` buffers.** Added an in-code explanation of why the per-token hot path mirrors partial-text/reasoning/tool-call buffers without holding `STREAMS_LOCK` (single writer + GIL-atomic `STORE_SUBSCR` on immutable strings → readers see complete-but-possibly-stale values, never torn), and why snapshot readers do take the lock. No behavior change. Thanks @ai-ag2026. (#5800)
+
 ### Fixed
+
+- **A stuck or half-open gateway connection no longer pins a turn for 10 minutes ignoring Stop.** Gateway SSE reads now carry a bounded byte-silence budget (default 600s, env-tunable via `HERMES_WEBUI_GATEWAY_READ_TIMEOUT`) and treat a read timeout as terminal — so pressing Stop during a silent stall ends the turn cleanly instead of waiting out the full timeout. The 600s default preserves the prior budget so legitimately long, silent tool calls are not cut off. Thanks @ai-ag2026. (#5789, #2476)
+
+- **Session loading is faster — addresses the "WebUI feels laggy" reports.** The session-load path (`/api/sessions` + session-by-id) had redundant full-metadata reads on every request; it now uses a profile-scoped, content-verified, lock-guarded cache (capped at 32 entries) with a fast path that only serves cached data when disk state is provably fresh, falling back to full comparison otherwise. Response shape and profile-scoping are unchanged. Thanks @Kopamed. (#5803, #5455)
+
+- **The background-wakeup status-row label is now localized.** The "Background wakeup" label introduced with the wakeup status row (#5766) was hardcoded English; it now resolves through `t('process_wakeup_label')`, with translations in all 15 locales. Thanks @Isla-Liu. (#5768)
+
+- **Concurrent remote-gateway health checks no longer stampede the gateway.** When many requests needed a remote-gateway health probe at once, each fired its own probe (a thundering herd). Probes are now single-flighted: one "leader" thread probes while latecomers wait (bounded) and share the result, guarded by a single condition/lock with a `finally` that always releases waiters even if the probe errors. Thanks @ai-ag2026. (#5798, #5455)
+
+- **Appending run-journal events no longer gets slower as a session's journal grows.** The next sequence number was recomputed by scanning existing entries on every append (O(n²) over a session's lifetime); it's now cached per journal path (guarded by a dedicated lock, evicted on journal delete), making each append O(1). Thanks @ai-ag2026. (#5799)
+
+- **The login page's connectivity retry timer is now cleared correctly.** The retry poller is started with `setInterval` but was cleared with `clearTimeout`, so once the server came back the interval kept firing (a zombie timer) instead of stopping and reloading once. It now uses `clearInterval`. Thanks @ai-ag2026. (#5801)
+
+- **A background wakeup no longer eats the assistant reply that preceded it.** When a background-process wakeup prompt arrived after an assistant response, the response could disappear from the interactive transcript (it remained in the DB and export). Background wakeups now render as their own distinct "Background wakeup" status row aligned to the message rail — with attachment support — leaving the prior reply intact. Thanks @Isla-Liu. (#5766)
+
+- **Service-tier (fast-mode) support is now derived from the agent's model metadata instead of a hardcoded list.** The service-tier control appears for a model only when the agent reports it supports the fast tier, so newly-supported models light up automatically and unsupported ones don't show a dead control. Falls back safely (no control) when the metadata is absent. Thanks @starship-s. (#5762, #4536)
+
+- **Live reasoning no longer briefly renders twice while a reply streams.** The streaming path updated the reasoning display through two renderers at once (the anchored reasoning block and the live thinking card), which could momentarily show the reasoning twice. It now routes through a single renderer — the live thinking card only updates when the anchored path didn't handle it. Thanks @rodboev. (#5773, #5720)
+
+- **A wide or tall code block in the chat no longer thrashes the surrounding layout while a reply streams.** Code blocks now use CSS `contain: content`, so a growing/overflowing `<pre>` is isolated to its own rounded container (with its own horizontal scroll) instead of reflowing the message column during streaming. Thanks @rodboev. (#5770, #5760)
+
+- **Workspace switcher is now navigable with a screen reader.** The workspace switcher exposes proper roles/labels and announces the "New Chat" workspace state transiently, and the closed workspace dropdown is kept out of screen-reader navigation so it isn't read while collapsed. Visual layout and click/keyboard behavior are unchanged. Thanks @rodboev. (#5721, #5671)
+
+- **A background child stream no longer bumps its parent session to the top of the sidebar.** When a child (branched/background) stream was active, its activity re-sorted the parent session's sidebar time-bucket, yanking the parent around while you were working elsewhere. The sidebar sort no longer keys the parent's bucket off child-stream activity, so parents stay put. Thanks @rodboev. (#5729, #5699)
+
+- **The embedded terminal now recovers from a dropped connection instead of silently freezing.** A transport-level failure on the terminal's output stream (session expired, gateway restarted, network drop) fired an EventSource `error` with no handler, so the terminal froze with no feedback. It now shows a "connection lost, reconnecting…" / "disconnected" line, lets the browser auto-reconnect a recoverable connection, and tears down a permanently-closed one so a restart can reconnect — notifying once per outage so a flapping connection can't flood the pane. Thanks @ai-ag2026. (#5786)
 
 - **The OpenCode Go model picker now lists the current flat-rate catalog.** The static `opencode-go` model snapshot was stale; it's been re-synced from the public opencode.ai/go docs + models endpoint (adds MiniMax M3, Kimi K2.7 Code, GLM-5.2, Qwen 3.7 Max/Plus, and more), keeping preview/free-only Zen models out of the Go picker. Thanks @ai-ag2026. (#5761)
 
