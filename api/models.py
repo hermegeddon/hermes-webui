@@ -27,6 +27,7 @@ from api.agent_sessions import (
     _is_continuation_session,
     is_cli_session_row,
     normalize_agent_session_source,
+    open_state_db_readonly,
     read_importable_agent_session_rows,
     read_session_lineage_metadata,
 )
@@ -392,7 +393,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
             # Avoid N filesystem exists() checks under LOCK by collecting
             # on-disk IDs once before entering the critical section.
             on_disk_ids = _persisted_session_ids_snapshot()
-            existing = json.loads(session_index_file.read_text(encoding='utf-8'))
+            existing = json.loads(session_index_file.read_bytes())
             if not isinstance(existing, list):
                 raise ValueError("session index must be a list")
             with LOCK:
@@ -456,7 +457,7 @@ def prune_session_from_index(session_id: str) -> None:
     with _INDEX_WRITE_LOCK:
         try:
             with LOCK:
-                existing = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+                existing = json.loads(SESSION_INDEX_FILE.read_bytes())
                 if not isinstance(existing, list):
                     raise ValueError("session index must be a list")
                 pruned = [e for e in existing if e.get('session_id') != sid]
@@ -1022,7 +1023,7 @@ def _index_message_count_map(entries=None) -> dict[str, int]:
     """
     if entries is None:
         try:
-            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
         except Exception:
             return {}
     if not isinstance(entries, list):
@@ -2636,7 +2637,7 @@ def _has_compression_continuation(session) -> bool:
 
     try:
         if SESSION_INDEX_FILE.exists():
-            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
             if isinstance(entries, list) and any(_row_is_continuation(e) for e in entries):
                 return True
     except Exception:
@@ -4140,7 +4141,7 @@ def state_db_has_session(sid: str) -> bool:
     if not db_path.exists():
         return False
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
             cur.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (str(sid),))
             return cur.fetchone() is not None
@@ -4246,7 +4247,7 @@ def agent_session_rows_existing(
     if db_path is None:
         return frozenset(wanted)
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             cols = {str(row[1]) for row in cur.fetchall()}
@@ -4302,7 +4303,7 @@ def agent_session_zero_message_sids(
     if db_path is None:
         return frozenset()
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             sessions_cols = {str(row[1]) for row in cur.fetchall()}
@@ -4399,7 +4400,7 @@ def _read_state_db_sidebar_overrides(
     except ImportError:
         return {}
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -4665,7 +4666,7 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     if SESSION_INDEX_FILE.exists():
         try:
             _diag_stage(diag, "all_sessions.read_index")
-            index = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            index = json.loads(SESSION_INDEX_FILE.read_bytes())
             _diag_stage(diag, "all_sessions.prune_index")
             with LOCK:
                 in_memory_ids = set(SESSIONS.keys())
@@ -4907,7 +4908,7 @@ def _backfill_project_profiles_if_needed(projects: list) -> bool:
     session_profile_by_project: dict[str, str] = {}
     if SESSION_INDEX_FILE.exists():
         try:
-            entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            entries = json.loads(SESSION_INDEX_FILE.read_bytes())
             untagged_ids = {p['project_id'] for p in untagged if p.get('project_id')}
             for e in entries:
                 pid = e.get('project_id')
@@ -6483,7 +6484,7 @@ def get_state_db_session_messages(
         return []
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")
@@ -6629,7 +6630,7 @@ def get_state_db_session_message_keys_before_timestamp(
         return []
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")
@@ -6679,7 +6680,7 @@ def get_state_db_session_summary(sid, *, profile=None) -> dict:
         return {"message_count": 0, "last_message_at": 0.0}
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")
@@ -7710,7 +7711,7 @@ def count_conversation_rounds(sid: str, since: float | None = None) -> int:
         return 0
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(open_state_db_readonly(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(

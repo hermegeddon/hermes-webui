@@ -7863,10 +7863,39 @@ class StreamChannel:
     of them instead of being consumed destructively by a single queue reader.
     """
 
+    # Cap on the offline replay buffer (drop-oldest). While no tab is subscribed,
+    # put_nowait() buffers the stream tail so a first/reconnecting subscriber can
+    # catch up. But a client that disconnects without cancelling leaves the turn
+    # running with zero subscribers, so an unbounded buffer here grows for the
+    # WHOLE turn (a busy turn emits thousands of coalesced token frames) — an OOM
+    # risk per abandoned turn (#4633). Bounding to the most recent N frames keeps
+    # a reconnecting tab's needed *tail* intact; older dropped frames stay
+    # recoverable via the run journal by last_event_id. 8192 is generous enough
+    # to hold a long multi-tool turn's backlog while capping worst-case memory to
+    # a fixed number of small (event, data, id) tuples — deliberately far above
+    # SessionChannel's per-subscriber maxsize of 16 (that queue drops on a *slow*
+    # reader; this buffer must survive a legitimate reconnect gap).
+    _OFFLINE_BUFFER_MAXLEN = 8192
+
     def __init__(self):
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
-        self._offline_buffer: list[tuple[str, object]] = []
+        self._offline_buffer: collections.deque = collections.deque(
+            maxlen=self._OFFLINE_BUFFER_MAXLEN
+        )
+        # Frames evicted at the cap from the CURRENT buffer content. Scoped to
+        # the buffer, NOT to an attach cycle: it resets exactly when the buffer
+        # itself is cleared (first live broadcast), never on subscribe/
+        # unsubscribe alone — a drain is a non-destructive copy, so after a
+        # transient attach the buffer is STILL truncated and reporting 0 would
+        # hand the next subscriber a silently-holed tail. Whether a given
+        # reconnect actually NEEDS the evicted frames is decided server-side
+        # against offline_first_event_id (its cursor may sit inside the
+        # retained tail). Also gates the one-shot eviction log.
+        self._offline_dropped = 0
+        # Cumulative evictions over the channel's lifetime, never reset — for ops
+        # visibility via diagnostic_snapshot().
+        self._offline_dropped_total = 0
         self._last_event_id: str | None = None
 
     def subscribe(self) -> queue.Queue:
@@ -7883,8 +7912,19 @@ class StreamChannel:
             # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
+            first = self._offline_buffer[0] if self._offline_buffer else None
             snapshot = {
                 "offline_buffered_events": len(self._offline_buffer),
+                # Surface eviction so the SSE handler can tell the tail it is
+                # about to drain may be truncated (older frames were dropped at
+                # the cap) and must be proven contiguous before streaming.
+                "offline_dropped_events": self._offline_dropped,
+                # Event id of the oldest retained frame: the handler needs run-
+                # journal coverage only for (client cursor → this frame); a
+                # cursor already inside the retained tail needs no journal.
+                "offline_first_event_id": (
+                    first[2] if first is not None and len(first) >= 3 else None
+                ),
                 "last_event_id": self._last_event_id,
             }
             self._subscribers.append(q)
@@ -7911,9 +7951,27 @@ class StreamChannel:
                 self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
+                # deque(maxlen) evicts the oldest frame automatically when full.
+                # Log once on the first eviction (debug: an abandoned/disconnected
+                # turn is expected to hit this) and keep a running dropped count
+                # for diagnostics.
+                if len(self._offline_buffer) >= self._OFFLINE_BUFFER_MAXLEN:
+                    if self._offline_dropped == 0:  # first eviction this cycle
+                        logger.debug(
+                            "StreamChannel offline buffer full (cap=%d); dropping "
+                            "oldest frames while no subscriber is connected",
+                            self._OFFLINE_BUFFER_MAXLEN,
+                        )
+                    self._offline_dropped += 1
+                    self._offline_dropped_total += 1
                 self._offline_buffer.append(item)
                 return
+            # A subscriber is live: events now broadcast directly, so the offline
+            # tail is drained. Reset the per-cycle eviction count (which also
+            # re-arms the one-shot log) so the NEXT disconnect/overflow cycle
+            # reports and logs its own truncation, not a stale carry-over.
             self._offline_buffer.clear()
+            self._offline_dropped = 0
         for q in subscribers:
             q.put_nowait(item)
 
@@ -7923,6 +7981,9 @@ class StreamChannel:
             return {
                 "subscriber_count": len(self._subscribers),
                 "offline_buffered_events": len(self._offline_buffer),
+                # Cumulative over the channel lifetime (ops visibility), vs. the
+                # per-cycle count subscribe_with_snapshot() reports for truncation.
+                "offline_dropped_events": self._offline_dropped_total,
             }
 
 
@@ -8668,6 +8729,64 @@ _SETTINGS_WRITE_VERSION = 0
 _SETTINGS_WRITE_LOCK = __import__("threading").Lock()
 
 
+def _atomic_write_settings_text(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (temp file + fsync + os.replace).
+
+    ``settings.json`` was rewritten with a plain ``Path.write_text``, which
+    truncates the file in place: a crash or full disk mid-write leaves it
+    truncated/empty, so the next start loses every persisted setting (theme,
+    workspace, tab order, and the login ``password_hash``). Writing to a
+    sibling temp file, fsyncing, then ``os.replace`` keeps the old contents
+    intact until the rename commits the new ones in one step.  Mirrors the
+    tempfile+fsync+os.replace pattern already used by
+    ``webui_session_db.WebUIJsonSessionDB._atomic_write``.
+
+    The existing file's mode is carried onto the replacement: ``os.replace``
+    swaps in the temp file's inode, and a plain ``open`` respects the umask
+    (typically 0644), so without this an operator-hardened ``settings.json``
+    (chmod 0600 because it holds the password hash) would be silently loosened
+    on the next save.  New files fall back to the umask-adjusted default.
+
+    A symlinked target is written through to its referent (same follow-through
+    as the ``Path.write_text`` this replaces), rather than replacing the link
+    itself with a regular file.
+    """
+    path = Path(path)
+    write_path = path.resolve(strict=False) if path.is_symlink() else path
+    tmp = write_path.with_name(
+        f".{write_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        mode = os.stat(write_path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o666 & ~_current_umask()
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, write_path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _current_umask() -> int:
+    """Read the process umask without leaving it changed.
+
+    ``os.umask`` has no read-only form (it sets and returns the prior value),
+    so we set-then-restore. Called only on the new-``settings.json`` path, which
+    is rare; the tiny set-to-0 window is acceptable here (unlike a per-write
+    hot path).
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    return umask
+
+
 def _coerce_provider_cost_budget(value: Any) -> float | None:
     """Normalize a monthly budget to the persisted two-decimal representation."""
     try:
@@ -8827,9 +8946,9 @@ def save_settings(settings: dict) -> dict:
     effective_persisted_speech_keys.update(applied_speech_keys)
     persisted = _settings_payload_for_write(current, effective_persisted_speech_keys)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(
+    _atomic_write_settings_text(
+        SETTINGS_FILE,
         json.dumps(persisted, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     global _SETTINGS_WRITE_VERSION
     with _SETTINGS_WRITE_LOCK:
@@ -8870,7 +8989,8 @@ if _settings_file_exists:
             startup_persisted_speech_keys = _extract_persisted_speech_keys(
                 _read_raw_settings_file()
             )
-            SETTINGS_FILE.write_text(
+            _atomic_write_settings_text(
+                SETTINGS_FILE,
                 json.dumps(
                     _settings_payload_for_write(
                         _startup_settings, startup_persisted_speech_keys
@@ -8878,7 +8998,6 @@ if _settings_file_exists:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                encoding="utf-8",
             )
         except Exception:
             pass
