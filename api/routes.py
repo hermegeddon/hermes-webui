@@ -2822,6 +2822,7 @@ from api.config import (
     _load_yaml_config_file,
     _save_yaml_config_file,
     reload_config,
+    get_config_for_profile_home,
     _cfg_lock,
     PENDING_BG_TASK_COMPLETIONS,
 )
@@ -11627,6 +11628,16 @@ def handle_get(handler, parsed) -> bool:
             settings["agent_version"] = AGENT_VERSION
         except Exception:
             pass
+        # Channel-scoped display badge — SEPARATE from webui_version (which is
+        # load-bearing for asset cache-busting / SW cache / skew detection and
+        # must stay channel-neutral). update_channel_version is display-only.
+        try:
+            from api.updates import channel_version_badge, _read_update_channel
+            channel = _read_update_channel()
+            settings["update_channel"] = channel
+            settings["update_channel_version"] = channel_version_badge(channel)
+        except Exception:
+            pass
         return j(handler, settings)
 
     if parsed.path == "/api/transcribe/capability":
@@ -13087,9 +13098,18 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, {"disabled": True})
         include_agent_updates = not bool(settings.get("ignore_agent_updates"))
         force = bool(body.get("force", False))
+        # Allow the client to pass the channel explicitly in the POST body. This
+        # avoids a race on channel switch: the Settings dropdown re-checks
+        # immediately, but its autosave PUT (debounced) may not have landed
+        # server-side yet, so reading the saved setting here could answer for the
+        # OLD channel. An explicit body channel (validated against the enum) wins;
+        # otherwise fall back to the saved setting. (Fable UX gate.)
+        channel = body.get("channel") if isinstance(body, dict) else None
+        if channel not in ("stable", "experimental"):
+            channel = settings.get("update_channel")
         from api.updates import check_for_updates
 
-        return j(handler, check_for_updates(force=force, include_agent=include_agent_updates))
+        return j(handler, check_for_updates(force=force, include_agent=include_agent_updates, channel=channel))
 
     if parsed.path == "/api/extensions/toggle":
         from api.extensions import ExtensionToggleError, set_extension_user_enabled
@@ -13864,6 +13884,15 @@ def handle_post(handler, parsed) -> bool:
         # Lock entries in SESSION_AGENT_LOCKS forever.
         with SESSION_AGENT_LOCKS_LOCK:
             SESSION_AGENT_LOCKS.pop(sid, None)
+        # Prune the completion-dedup entry too. The reaper sweeps it once the
+        # completion is delivered (drained from PENDING); a session deleted
+        # while a completion is still pending would otherwise keep its entry.
+        try:
+            from api.background_process import forget_bg_task_completion_dedup
+
+            forget_bg_task_completion_dedup(sid)
+        except Exception:
+            logger.debug("Failed to prune bg-task dedup entry for deleted session %s", sid)
         try:
             from api.terminal import close_terminal
             close_terminal(sid)
@@ -15113,17 +15142,27 @@ def handle_post(handler, parsed) -> bool:
         target = body.get("target", "")
         if target not in ("webui", "agent"):
             return bad(handler, 'target must be "webui" or "agent"')
+        # Honor an explicit validated body channel (the client sends the channel
+        # the banner was offering) so a channel switch whose debounced autosave
+        # hasn't landed can't make apply read the OLD saved channel (Codex gate).
+        # Fall back to the saved setting when absent/invalid.
+        _apply_channel = body.get("channel") if isinstance(body, dict) else None
+        if _apply_channel not in ("stable", "experimental"):
+            _apply_channel = None
         from api.updates import apply_update
 
-        return j(handler, apply_update(target))
+        return j(handler, apply_update(target, _apply_channel))
 
     if parsed.path == "/api/updates/force":
         target = body.get("target", "")
         if target not in ("webui", "agent"):
             return bad(handler, 'target must be "webui" or "agent"')
+        _force_channel = body.get("channel") if isinstance(body, dict) else None
+        if _force_channel not in ("stable", "experimental"):
+            _force_channel = None
         from api.updates import apply_force_update
 
-        return j(handler, apply_force_update(target))
+        return j(handler, apply_force_update(target, _force_channel))
 
     if parsed.path == "/api/updates/clear_lock":
         # Manual-instruction recovery for the .git/index.lock case. The
@@ -15313,13 +15352,15 @@ def handle_post(handler, parsed) -> bool:
             _record_login_attempt(client_ip)
             return bad(handler, str(e), status=401)
         cookie_val = create_session()
+        body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         set_auth_cookie(handler, cookie_val)
         handler.end_headers()
-        handler.wfile.write(json.dumps({"ok": True}).encode())
+        handler.wfile.write(body)
         return True
 
     if parsed.path == "/api/auth/passkey/register/options":
@@ -24197,7 +24238,7 @@ def _mcp_tools_from_registry(server_summaries):
 
 def _handle_mcp_tools_list(handler):
     """List known MCP tools from already-available runtime inventory only."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}
@@ -24711,7 +24752,7 @@ def _handle_notes_item(handler, parsed):
 
 def _handle_mcp_servers_list(handler):
     """List configured MCP servers with safe, read-only runtime visibility."""
-    cfg = get_config()
+    cfg = get_config_for_profile_home(get_active_hermes_home())
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}

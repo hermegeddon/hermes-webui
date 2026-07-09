@@ -703,6 +703,13 @@ def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
         target = Path(profile_home).expanduser()
     except Exception:
         return get_config()
+    try:
+        from api.profiles import get_active_hermes_home
+
+        if Path(get_active_hermes_home()).expanduser() == target:
+            return get_config()
+    except Exception:
+        pass
     # If the ambient resolver already points at this profile home, defer to
     # get_config() so in-memory overrides (monkeypatched cfg) are honored. This
     # MUST run before the nonexistent-home guard below: a matching ambient home
@@ -1759,22 +1766,29 @@ _PROVIDER_MODELS = {
         {"id": "nemotron-3-super-free", "label": "Nemotron 3 Super Free"},
         {"id": "big-pickle", "label": "Big Pickle"},
     ],
-    # OpenCode Go — flat-rate models via opencode.ai/go ($10/month)
+    # OpenCode Go — flat-rate models via opencode.ai/go ($10/month).
+    # Synced 2026-07-08 from the public Go docs and documented models endpoint.
+    # Keep preview/free-only Zen models out of this Go picker snapshot.
     "opencode-go": [
+        {"id": "minimax-m3",       "label": "MiniMax M3"},
+        {"id": "minimax-m2.7",     "label": "MiniMax M2.7"},
+        {"id": "minimax-m2.5",     "label": "MiniMax M2.5"},
+        {"id": "kimi-k2.7-code",   "label": "Kimi K2.7 Code"},
+        {"id": "kimi-k2.6",        "label": "Kimi K2.6"},
+        {"id": "kimi-k2.5",        "label": "Kimi K2.5"},
+        {"id": "glm-5.2",          "label": "GLM-5.2"},
         {"id": "glm-5.1",          "label": "GLM-5.1"},
         {"id": "glm-5",            "label": "GLM-5"},
-        {"id": "kimi-k2.5",        "label": "Kimi K2.5"},
-        {"id": "kimi-k2.6",        "label": "Kimi K2.6"},
         {"id": "deepseek-v4-pro",  "label": "DeepSeek V4 Pro"},
         {"id": "deepseek-v4-flash","label": "DeepSeek V4 Flash"},
+        {"id": "qwen3.7-max",      "label": "Qwen3.7 Max"},
+        {"id": "qwen3.7-plus",     "label": "Qwen3.7 Plus"},
+        {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
+        {"id": "qwen3.5-plus",     "label": "Qwen3.5 Plus"},
         {"id": "mimo-v2-pro",      "label": "MiMo V2 Pro"},
         {"id": "mimo-v2-omni",     "label": "MiMo V2 Omni"},
         {"id": "mimo-v2.5-pro",    "label": "MiMo V2.5 Pro"},
         {"id": "mimo-v2.5",        "label": "MiMo V2.5"},
-        {"id": "minimax-m2.7",     "label": "MiniMax M2.7"},
-        {"id": "minimax-m2.5",     "label": "MiniMax M2.5"},
-        {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
-        {"id": "qwen3.5-plus",     "label": "Qwen3.5 Plus"},
     ],
     # 'gemini' is the hermes_cli provider ID for Google AI Studio
     # Model IDs are bare — sent directly to:
@@ -8176,6 +8190,7 @@ _SETTINGS_DEFAULTS = {
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
+    "update_channel": "stable",  # stable | experimental — which release stream to track (stable = soaked/promoted; experimental = every batch)
     "ignore_agent_updates": False,  # keep WebUI update notices but suppress Agent update checks
     "whats_new_summary_enabled": False,  # show an LLM-written What's New summary before diff links
     "tts_enabled": False,
@@ -8456,6 +8471,7 @@ _SETTINGS_ALLOWED_KEYS = set(_SETTINGS_DEFAULTS.keys()) - {
 _SETTINGS_ENUM_VALUES = {
     "send_key": {"enter", "ctrl+enter", "shift+enter"},
     "sidebar_density": {"compact", "detailed"},
+    "update_channel": {"stable", "experimental"},
     "font_size": {"small", "default", "large", "xlarge"},
     "auto_title_refresh_every": {"0", "5", "10", "20"},
     "default_message_mode": {"queue", "interrupt", "steer"},
