@@ -5778,7 +5778,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             S.session=d.session;
             const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);
             _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
-            S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
+            const _currentMessages=Array.isArray(S.messages)?S.messages:[];
+            const _currentVisibleMessages=_filterRecoveryControlMessages(_currentMessages || []);
+            const _stagedMessages=_carryForwardEphemeralTurnFields(_currentMessages, _nextMsgs3018);
+            const _stagedMatchesCurrentPrefix=(
+              _stagedMessages.length>0 &&
+              _stagedMessages.length<_currentVisibleMessages.length &&
+              _stagedMessages.every((message, idx)=>{
+                const stagedKey=_messageIdentityKey(message);
+                const currentKey=_messageIdentityKey(_currentVisibleMessages[idx]);
+                return !!stagedKey && stagedKey===currentKey;
+              })
+            );
+            const _preserveCurrentTranscript=_stagedMatchesCurrentPrefix;
+            const _resolvedMessages=_preserveCurrentTranscript
+              ? [..._stagedMessages,..._currentVisibleMessages.slice(_stagedMessages.length)]
+              : _stagedMessages;
+            S.messages=_filterRecoveryControlMessages(_resolvedMessages || []);
             if(S.session&&S.session.session_id){
               try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
               if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);

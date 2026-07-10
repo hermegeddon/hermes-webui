@@ -8721,9 +8721,13 @@ def _run_agent_streaming(
                     and not _tool_limit_reached
                     and not _last_err
                 )
+                # A terminal result with no concrete provider error can still be a
+                # real turn if the transcript already contains a final assistant
+                # answer for this turn (e.g. the agent marked the result failed
+                # after producing output). Downgrading it to "No response from
+                # provider" clobbers the real answer and confuses users.
                 if (
                     _terminal_failure
-                    and _soft_partial_terminal_failure
                     and _classification['type'] == 'no_response'
                     and not _saved_transcript_lacks_final_answer
                 ):
