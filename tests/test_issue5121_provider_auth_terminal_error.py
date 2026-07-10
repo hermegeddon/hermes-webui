@@ -645,6 +645,40 @@ def test_hard_failure_with_completed_answer_still_reports_no_response(tmp_path, 
     assert saved.messages[-1]["_error"] is True
 
 
+def test_concrete_provider_error_with_completed_answer_remains_visible(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "provider_error_completed_answer",
+        "stream_provider_error_completed_answer",
+        pending_user_message="Please finish despite the provider error",
+    )
+
+    class ProviderErrorCompletedAnswerAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "status": "failed",
+                "messages": history + [{"role": "assistant", "content": "Completed answer"}],
+                "error": "HTTP 429: quota exceeded",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_provider_error_completed_answer",
+        ProviderErrorCompletedAnswerAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("provider_error_completed_answer")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected the concrete provider error to remain terminal"
+    assert apperrors[-1]["type"] == "quota_exhausted"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+
+
 def test_non_auth_partial_delivery_persists_error_turn(tmp_path, monkeypatch):
     session = _prepare_session("partial_escape", "stream_partial_escape", pending_user_message="Please handle partial silence")
 

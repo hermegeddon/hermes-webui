@@ -7,7 +7,10 @@ frontend must not discard the already-rendered live messages.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import shutil
+import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
 MESSAGES_JS = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
@@ -66,28 +69,71 @@ def test_apperror_handler_reads_session_payload():
 
 def test_apperror_uses_prefix_preservation_for_shorter_session_snapshot():
     """Direct apperror session replacement must use prefix-preservation logic."""
-    body = _event_block("apperror")
+    body = _function_body("_mergeAppErrorSessionMessages")
     compact = _compact(body)
     # The handler must compute whether the server snapshot is a strict prefix
     # of the current visible transcript before replacing S.messages wholesale.
-    assert "_stagedMessages.length<_currentVisibleMessages.length" in compact
-    assert "_stagedMessages.every((message,idx)" in compact
+    assert "staged.length<currentVisible.length" in compact
+    assert "staged.every((message,idx)" in compact
     assert "_messageIdentityKey(message)" in compact
-    assert "_messageIdentityKey(_currentVisibleMessages[idx])" in compact
+    assert "_messageIdentityKey(currentVisible[idx])" in compact
 
 
 def test_apperror_preserves_visible_suffix_when_snapshot_is_prefix():
     """If the server snapshot is a prefix, current visible suffix must survive."""
-    body = _event_block("apperror")
+    body = _function_body("_mergeAppErrorSessionMessages")
     compact = _compact(body)
-    assert "_preserveCurrentTranscript" in compact
-    assert "_resolvedMessages=_preserveCurrentTranscript" in compact
-    assert "_stagedMessages,..._currentVisibleMessages.slice(_stagedMessages.length)" in compact
+    assert "stagedMatchesCurrentPrefix" in compact
+    assert "resolved=stagedMatchesCurrentPrefix" in compact
+    assert "staged,...currentVisible.slice(staged.length)" in compact
+
+
+def test_apperror_merge_preserves_visible_suffix_and_appends_terminal_error():
+    """A stale session snapshot must keep live text without hiding the app error."""
+    body = _function_body("_mergeAppErrorSessionMessages")
+    node = shutil.which("node")
+    if not node:
+        raise AssertionError("node is required for JavaScript behavior checks")
+    harness = f"""
+const _filterRecoveryControlMessages=(messages)=>messages.filter(Boolean);
+const _carryForwardEphemeralTurnFields=(_previous, next)=>next.map((message)=>({{...message}}));
+const _messageIdentityKey=(message)=>message && `${{message.role}}|${{message.content}}`;
+function _mergeAppErrorSessionMessages(currentMessages, nextMessages, terminalMessage){body}
+const current=[
+  {{role:'user',content:'hello'}},
+  {{role:'assistant',content:'visible streamed answer'}},
+];
+const staged=[{{role:'user',content:'hello'}}];
+const terminal={{role:'assistant',content:'**Rate limit reached:** HTTP 429'}};
+const once=_mergeAppErrorSessionMessages(current, staged, terminal);
+const twice=_mergeAppErrorSessionMessages(once, staged, terminal);
+console.log(JSON.stringify({{once,twice}}));
+"""
+    proc = subprocess.run(
+        [node, "-e", harness], capture_output=True, text=True, timeout=30, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    merged = json.loads(proc.stdout)
+    expected = [
+        "hello",
+        "visible streamed answer",
+        "**Rate limit reached:** HTTP 429",
+    ]
+    assert [message["content"] for message in merged["once"]] == expected
+    assert [message["content"] for message in merged["twice"]] == expected
+
+
+def test_apperror_attaches_anchor_after_merging_terminal_error():
+    body = _event_block("apperror")
+    merge_idx = body.index("S.messages=_mergeAppErrorSessionMessages(")
+    attach_idx = body.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);", merge_idx)
+    render_idx = body.index("renderMessages({preserveScroll:true});", attach_idx)
+    assert merge_idx < attach_idx < render_idx
 
 
 def test_apperror_reuses_carry_forward_for_ephemeral_fields():
     """Ephemeral turn fields must still be carried across matched messages."""
-    body = _event_block("apperror")
+    body = _function_body("_mergeAppErrorSessionMessages")
     compact = _compact(body)
     assert "_carryForwardEphemeralTurnFields" in compact
 

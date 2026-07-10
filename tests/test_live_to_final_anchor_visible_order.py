@@ -841,12 +841,12 @@ def test_application_error_settlement_attaches_projected_anchor_scene_before_ren
 
     assert "_applyToAnchor('apperror'" in apperror
     session_idx = apperror.index("const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);")
-    attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);")
-    carry_idx = apperror.index("S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);")
+    merge_idx = apperror.index("S.messages=_mergeAppErrorSessionMessages(S.messages||[], _nextMsgs3018, terminalMessage);")
+    attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);", merge_idx)
     render_idx = apperror.index("renderMessages({preserveScroll:true});")
-    assert session_idx < attach_idx < carry_idx < render_idx
+    assert session_idx < merge_idx < attach_idx < render_idx
 
-    synthetic_push_idx = apperror.index("S.messages.push({role:'assistant',content:`**${label}:**")
+    synthetic_push_idx = apperror.index("S.messages.push(terminalMessage);")
     synthetic_attach_idx = apperror.index("_attachProjectedAnchorSceneToLastAssistant(S.messages);", synthetic_push_idx)
     assert synthetic_push_idx < synthetic_attach_idx < render_idx
 

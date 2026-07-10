@@ -1,9 +1,9 @@
 """Regression tests for issue #1765 false-positive "No response from provider".
 
-When the agent returns a terminal/partial/failed result but the transcript
-already contains a final assistant answer for the current turn, the WebUI
-settlement path must not downgrade the result to the generic
-``no_response`` / "No response from provider" card.
+When the agent returns a soft partial result but the transcript already
+contains a final assistant answer for the current turn, the WebUI settlement
+path must not downgrade the turn to the generic ``no_response`` card. Hard
+failures and tool-limit outcomes must remain terminal.
 """
 from __future__ import annotations
 
@@ -37,8 +37,8 @@ def _make_result(status: str, *, partial: bool = False, failed: bool = False, er
     return result
 
 
-def test_terminal_failure_with_final_answer_is_not_downgraded_to_no_response():
-    """A failed result that still produced an assistant answer is not silent."""
+def test_failed_result_with_final_answer_is_still_detected_as_terminal():
+    """An answer does not erase the failed result's terminal shape."""
     result = _make_result("failed")
     assert _agent_result_terminal_failure(result)
     assert _assistant_reply_added_after_current_turn(
@@ -54,9 +54,8 @@ def test_terminal_failure_with_final_answer_is_not_downgraded_to_no_response():
         _last_err,
         silent_failure=not bool(_last_err),
     )
-    # The classifier itself still returns no_response for empty errors; the
-    # settlement path is responsible for not using that classification when a
-    # real answer exists.
+    # The classifier still returns no_response for empty errors. Settlement may
+    # suppress it only for a soft partial result, not this hard failure.
     assert classification["type"] == "no_response"
 
 
@@ -83,8 +82,8 @@ def test_partial_terminal_failure_with_final_answer_is_not_downgraded():
     )
 
 
-def test_failed_terminal_failure_with_final_answer_is_not_downgraded():
-    """A result with failed=True that produced a final answer should not be downgraded."""
+def test_failed_flag_with_final_answer_is_still_detected_as_terminal():
+    """A failed=True flag remains terminal even when an answer exists."""
     result = _make_result("ok", failed=True)
     assert _agent_result_terminal_failure(result)
     assert not _merged_transcript_lacks_final_assistant_answer(

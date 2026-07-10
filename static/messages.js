@@ -2176,6 +2176,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!Array.isArray(messages)) return [];
     return messages.filter((m)=>!_streamRecoveryControlMessage(m));
   }
+  function _mergeAppErrorSessionMessages(currentMessages, nextMessages, terminalMessage){
+    const current=Array.isArray(currentMessages)?currentMessages:[];
+    const currentVisible=_filterRecoveryControlMessages(current);
+    const staged=_carryForwardEphemeralTurnFields(current, Array.isArray(nextMessages)?nextMessages:[]);
+    const stagedMatchesCurrentPrefix=(
+      staged.length>0 &&
+      staged.length<currentVisible.length &&
+      staged.every((message, idx)=>{
+        const stagedKey=_messageIdentityKey(message);
+        const currentKey=_messageIdentityKey(currentVisible[idx]);
+        return !!stagedKey && stagedKey===currentKey;
+      })
+    );
+    let resolved=stagedMatchesCurrentPrefix
+      ? [...staged,...currentVisible.slice(staged.length)]
+      : staged;
+    if(stagedMatchesCurrentPrefix&&terminalMessage){
+      const terminalContent=String(terminalMessage.content||'');
+      const alreadyVisible=resolved.some((message)=>
+        message&&message.role==='assistant'&&String(message.content||'')===terminalContent
+      );
+      if(!alreadyVisible) resolved=[...resolved,terminalMessage];
+    }
+    return _filterRecoveryControlMessages(resolved);
+  }
   function _replaceMarkerOnlyAssistantWithStreamError(messages){
     if(!Array.isArray(messages)) return false;
     const msg=[...messages].reverse().find(m=>m&&m.role==='assistant');
@@ -5770,6 +5795,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const hint=d.hint?`\n\n*${d.hint}*`:'';
           const details=d.details?String(d.details).replace(/```/g,'`\u200b``'):'';
           const detailsLabel=isCancelled?'Cancellation details':isInterrupted?'Interruption details':isToolLimitReached?'Terminal state details':undefined;
+          const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')?d.compression_recovery:null;
+          const terminalMessage={role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined};
           window._compressionUi=null;
           if(typeof clearCompressionUi==='function') clearCompressionUi();
           if(isRecoveryControlMessage){
@@ -5777,31 +5804,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           } else if(d.session&&typeof d.session==='object'){
             S.session=d.session;
             const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);
-            _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
-            const _currentMessages=Array.isArray(S.messages)?S.messages:[];
-            const _currentVisibleMessages=_filterRecoveryControlMessages(_currentMessages || []);
-            const _stagedMessages=_carryForwardEphemeralTurnFields(_currentMessages, _nextMsgs3018);
-            const _stagedMatchesCurrentPrefix=(
-              _stagedMessages.length>0 &&
-              _stagedMessages.length<_currentVisibleMessages.length &&
-              _stagedMessages.every((message, idx)=>{
-                const stagedKey=_messageIdentityKey(message);
-                const currentKey=_messageIdentityKey(_currentVisibleMessages[idx]);
-                return !!stagedKey && stagedKey===currentKey;
-              })
-            );
-            const _preserveCurrentTranscript=_stagedMatchesCurrentPrefix;
-            const _resolvedMessages=_preserveCurrentTranscript
-              ? [..._stagedMessages,..._currentVisibleMessages.slice(_stagedMessages.length)]
-              : _stagedMessages;
-            S.messages=_filterRecoveryControlMessages(_resolvedMessages || []);
+            S.messages=_mergeAppErrorSessionMessages(S.messages||[], _nextMsgs3018, terminalMessage);
+            _attachProjectedAnchorSceneToLastAssistant(S.messages);
             if(S.session&&S.session.session_id){
               try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
               if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
             }
           } else {
-            const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')?d.compression_recovery:null;
-            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
+            S.messages.push(terminalMessage);
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
         }catch(_){
